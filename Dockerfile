@@ -20,7 +20,8 @@ ENV RUST_BACKTRACE 1
 COPY --from=build /cnosdb/target/release/main /usr/bin/cnosdb
 
 COPY ./docker/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
 COPY ./config/config.toml /etc/cnosdb/cnosdb.conf
+RUN chmod +x /usr/bin/cnosdb
+RUN chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]
