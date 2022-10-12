@@ -24,4 +24,4 @@ COPY ./config/config.toml /etc/cnosdb/cnosdb.conf
 RUN chmod +x /usr/bin/cnosdb
 RUN chmod +x /entrypoint.sh
 
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["while true; do echo hello world; sleep 1; done"]
