@@ -24,4 +24,6 @@ COPY ./config/config.toml /etc/cnosdb/cnosdb.conf
 RUN chmod +x /usr/bin/cnosdb
 RUN chmod +x /entrypoint.sh
 
-ENTRYPOINT ["/entrypoint.sh"]
+CMD ["whereis cnosdb"]
+
+# ENTRYPOINT ["/entrypoint.sh"]
