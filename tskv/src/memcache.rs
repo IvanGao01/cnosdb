@@ -1,8 +1,8 @@
-use flatbuffers::Push;
+use flatbuffers::{ForwardsUOffset, Push, Vector};
 use futures::future::ok;
 
-use models::{utils, FieldId, RwLockRef, SeriesId, Timestamp, ValueType};
-use protos::models::{FieldType, Rows};
+use models::{utils, FieldId, RwLockRef, SchemaId, SeriesId, Timestamp, ValueType};
+use protos::models::{Field, FieldType, Point};
 
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::HashSet;
@@ -19,7 +19,10 @@ use trace::{error, info, warn};
 
 use crate::tsm::DataBlock;
 use crate::{byte_utils, error::Result, tseries_family::TimeRange};
+use models::schema::{TableFiled, TableSchema};
+use models::utils::{split_id, unite_id};
 use parking_lot::{RwLock, RwLockReadGuard};
+use snafu::OptionExt;
 
 use protos::models as fb_models;
 
@@ -106,6 +109,72 @@ pub struct RowData {
     pub fields: Vec<Option<FieldVal>>,
 }
 
+impl RowData {
+    pub fn point_to_row_data(
+        p: fb_models::Point,
+        schema: TableSchema,
+        sid: SeriesId,
+    ) -> (RowData, Vec<u32>) {
+        let mut field_id = vec![];
+        let fields = match p.fields() {
+            None => {
+                let mut fields = Vec::with_capacity(schema.field_fields_num());
+                for i in 0..fields.capacity() {
+                    fields.push(None);
+                    field_id.push(0);
+                }
+                fields
+            }
+            Some(fields_inner) => {
+                let fields_id = schema.fields_id();
+                let mut fields: Vec<Option<FieldVal>> = Vec::with_capacity(fields_id.len());
+                for i in 0..fields.capacity() {
+                    fields.push(None);
+                    field_id.push(0);
+                }
+                for (i, f) in fields_inner.into_iter().enumerate() {
+                    let vtype = f.type_().into();
+                    let val = MiniVec::from(f.value().unwrap());
+                    match schema.fields.get(
+                        String::from_utf8(f.name().unwrap().to_vec())
+                            .unwrap()
+                            .as_str(),
+                    ) {
+                        None => {}
+                        Some(field) => match fields_id.get(&field.id) {
+                            None => {}
+                            Some(index) => {
+                                fields[*index] = Some(FieldVal::new(val, vtype));
+                                field_id[*index] = field.id as u32;
+                            }
+                        },
+                    }
+                }
+                fields
+            }
+        };
+        let ts = p.timestamp();
+        (RowData { ts, fields }, field_id)
+    }
+
+    pub fn size(&self) -> usize {
+        let mut size = 0;
+        for i in self.fields.iter() {
+            match i {
+                None => {
+                    size += size_of_val(i);
+                }
+                Some(v) => {
+                    size += size_of_val(i) + v.heap_size();
+                }
+            }
+        }
+        size += size_of_val(&self.ts);
+        size += size_of_val(&self.fields);
+        size
+    }
+}
+
 impl From<fb_models::Point<'_>> for RowData {
     fn from(p: fb_models::Point<'_>) -> Self {
         let fields = match p.fields() {
@@ -128,7 +197,7 @@ impl From<fb_models::Point<'_>> for RowData {
 
 #[derive(Debug)]
 pub struct RowGroup {
-    pub schema_id: u32,
+    pub schema_id: SchemaId,
     pub schema: Vec<u32>,
     pub range: TimeRange,
     pub rows: Vec<RowData>,
@@ -150,6 +219,9 @@ impl SeriesData {
             if item.schema_id == group.schema_id {
                 item.range.merge(&group.range);
                 item.rows.append(&mut group.rows);
+                item.schema.append(&mut group.schema);
+                item.schema.sort();
+                item.schema.dedup();
                 return;
             }
         }
@@ -205,7 +277,7 @@ impl SeriesData {
         Some(Arc::new(RwLock::new(entry)))
     }
 
-    pub fn flat_groups(&self) -> Vec<(u32, &Vec<u32>, &Vec<RowData>)> {
+    pub fn flat_groups(&self) -> Vec<(SchemaId, &Vec<u32>, &Vec<RowData>)> {
         self.groups
             .iter()
             .map(|g| (g.schema_id, &g.schema, &g.rows))
@@ -268,6 +340,7 @@ impl MemCache {
     }
 
     pub fn write_group(&self, sid: u64, seq: u64, group: RowGroup) {
+        let (_, sid) = split_id(sid);
         self.seq_no.store(seq, Ordering::Relaxed);
         self.cache_size
             .fetch_add(group.size as u64, Ordering::Relaxed);
@@ -451,7 +524,7 @@ impl Display for DataType {
 #[cfg(test)]
 pub(crate) mod test {
     use bytes::buf;
-    use models::{SeriesId, Timestamp};
+    use models::{SchemaId, SeriesId, Timestamp};
     use std::mem::{size_of, size_of_val};
 
     use crate::{tsm::DataBlock, TimeRange};
@@ -461,7 +534,7 @@ pub(crate) mod test {
     pub(crate) fn put_rows_to_cache(
         cache: &mut MemCache,
         series_id: SeriesId,
-        schema_id: u32,
+        schema_id: SchemaId,
         schema_column_ids: Vec<u32>,
         time_range: (Timestamp, Timestamp),
         put_none: bool,

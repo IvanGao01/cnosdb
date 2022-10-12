@@ -34,11 +34,7 @@ use crate::{
     memcache::{DataType, FieldVal, MemCache, MemEntry, SeriesData},
     summary::{CompactMeta, SummaryTask, VersionEdit},
     tseries_family::{LevelInfo, Version},
-    tsm::{
-        self,
-        codec::{DataBlockEncoding, Encoding},
-        DataBlock, TsmWriter,
-    },
+    tsm::{self, codec::DataBlockEncoding, DataBlock, TsmWriter},
     version_set::VersionSet,
     TseriesFamilyId,
 };
@@ -51,7 +47,6 @@ struct FlushingBlock {
 
 pub struct FlushTask {
     mem_caches: Vec<Arc<RwLock<MemCache>>>,
-    database: Option<Arc<RwLock<Database>>>,
     ts_family_id: TseriesFamilyId,
     global_context: Arc<GlobalContext>,
     path_tsm: PathBuf,
@@ -61,7 +56,6 @@ pub struct FlushTask {
 impl FlushTask {
     pub fn new(
         mem_caches: Vec<Arc<RwLock<MemCache>>>,
-        database: Option<Arc<RwLock<Database>>>,
         ts_family_id: TseriesFamilyId,
         global_context: Arc<GlobalContext>,
         path_tsm: impl AsRef<Path>,
@@ -69,7 +63,6 @@ impl FlushTask {
     ) -> Self {
         Self {
             mem_caches,
-            database,
             ts_family_id,
             global_context,
             path_tsm: path_tsm.as_ref().into(),
@@ -338,26 +331,10 @@ impl FlushTask {
 
         Ok(compact_metas)
     }
-
-    fn get_table_schema(&self, series_id: SeriesId) -> Result<Vec<FieldInfo>> {
-        match self.database.as_ref() {
-            None => {
-                warn!("database not found, get empty schema",);
-                Ok(Vec::with_capacity(0))
-            }
-            Some(db) => {
-                let schema_opt = db
-                    .read()
-                    .get_table_schema_by_series_id(series_id)
-                    .context(error::IndexErrSnafu)?;
-                Ok(schema_opt.unwrap_or_else(|| Vec::with_capacity(0)))
-            }
-        }
-    }
 }
 
 pub fn run_flush_memtable_job(
-    reqs: Arc<Mutex<Vec<FlushReq>>>,
+    req: FlushReq,
     global_context: Arc<GlobalContext>,
     version_set: Arc<RwLock<VersionSet>>,
     summary_task_sender: UnboundedSender<SummaryTask>,
@@ -365,45 +342,40 @@ pub fn run_flush_memtable_job(
 ) -> Result<()> {
     let mut tsf_caches: HashMap<TseriesFamilyId, Vec<Arc<RwLock<MemCache>>>> = HashMap::new();
     {
-        let mut reqs = reqs.lock();
-        info!("Flush: Running flush job on {} MemCaches", reqs.len());
-        if reqs.len() == 0 {
+        info!("Flush: Running flush job on {} MemCaches", req.mems.len());
+        if req.mems.is_empty() {
             return Ok(());
         }
-        for req in reqs.iter() {
-            for (tf, mem) in &req.mems {
-                let mem_vec = tsf_caches.entry(*tf).or_insert(Vec::new());
-                mem_vec.push(mem.clone());
-            }
+        for (tf, mem) in req.mems {
+            let mem_vec = tsf_caches.entry(tf).or_insert(Vec::new());
+            mem_vec.push(mem.clone());
         }
-        reqs.clear();
     }
 
     let mut edits: Vec<VersionEdit> = vec![];
     for (tsf_id, caches) in tsf_caches.iter() {
-        if let Some(tsf) = version_set.read().get_tsfamily_by_tf_id(*tsf_id) {
-            if caches.is_empty() {
-                continue;
-            }
-
+        if caches.is_empty() {
+            continue;
+        }
+        let tsf_warp = version_set.read().get_tsfamily_by_tf_id(*tsf_id);
+        if let Some(tsf) = tsf_warp {
             // todo: build path by vnode data
             let tsf_rlock = tsf.read();
             let storage_opt = tsf_rlock.storage_opt();
+            let version = tsf_rlock.version();
             let database = tsf_rlock.database();
-            let db_instance = version_set.read().get_db(&database);
+            drop(tsf_rlock);
             let path_tsm = storage_opt.tsm_dir(&database, *tsf_id);
             let path_delta = storage_opt.delta_dir(&database, *tsf_id);
-            drop(tsf_rlock);
 
             FlushTask::new(
                 caches.clone(),
-                db_instance,
                 *tsf_id,
                 global_context.clone(),
                 path_tsm,
                 path_delta,
             )
-            .run(tsf.read().version(), &mut edits)?;
+            .run(version, &mut edits)?;
 
             if let Err(e) = compact_task_sender.send(*tsf_id) {
                 error!("{}", e);
@@ -566,7 +538,7 @@ pub mod flush_tests {
             last_seq: 1, max_level_ts,
             levels_info: LevelInfo::init_levels(database, options.storage),
         });
-        let flush_task = FlushTask::new(caches, None, 1, global_context, &tsm_dir, &delta_dir);
+        let flush_task = FlushTask::new(caches, 1, global_context, &tsm_dir, &delta_dir);
         let mut version_edits = vec![];
         flush_task.run(version, &mut version_edits).unwrap();
 
