@@ -24,4 +24,5 @@ COPY ./config/config.toml /etc/cnosdb/cnosdb.conf
 RUN chmod +x /usr/bin/cnosdb
 RUN chmod +x /entrypoint.sh
 
-ENTRYPOINT ["/entrypoint.sh"]
+
+CMD cnosdb --cpu 4 --memory 64 --config /etc/cnosdb/cnosdb.conf
