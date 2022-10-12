@@ -4,4 +4,4 @@ set -e
 
 CONFIG_FILE=/etc/cnosdb/cnosdb.conf
 
-exec "cnosdb run --cup 4 --memory 64 --config ${CONFIG_FILE}"
+exec "/usr/bin/cnosdb run --cpu 4 --memory 64 --config ${CONFIG_FILE}"
