@@ -1,5 +1,5 @@
 ARG RUST_VERSION=1.62.1
-FROM rust:${RUST_VERSION}-slim-bullseye as build
+FROM rust:${RUST_VERSION}-slim-bullseye as builder
 
 RUN apt update \
     && apt install --yes pkg-config openssl libssl-dev g++ cmake git
@@ -17,10 +17,10 @@ FROM ubuntu:focal
 
 ENV RUST_BACKTRACE 1
 
-COPY --from=build /cnosdb/target/release/main /usr/bin/cnosdb
+COPY --from=builder /cnosdb/target/release/main /usr/bin/cnosdb
 
-COPY ./docker/entrypoint.sh /entrypoint.sh
-COPY ./config/config.toml /etc/cnosdb/cnosdb.conf
+COPY docker/entrypoint.sh /entrypoint.sh
+COPY config/config.toml /etc/cnosdb/cnosdb.conf
 RUN chmod +x /usr/bin/cnosdb
 RUN chmod +x /entrypoint.sh
 
