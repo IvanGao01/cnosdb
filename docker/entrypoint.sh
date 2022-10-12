@@ -2,4 +2,4 @@ set -e
 
 CONFIG_FILE=/etc/cnosdb/cnosdb.conf
 
-exec sleep 10000
+exec "sleep 10000"
