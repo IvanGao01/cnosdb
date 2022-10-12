@@ -25,4 +25,4 @@ RUN chmod +x /usr/bin/cnosdb
 RUN chmod +x /entrypoint.sh
 
 
-CMD cnosdb --cpu 4 --memory 64 --config /etc/cnosdb/cnosdb.conf
+CMD cnosdb run --cpu 4 --memory 64 --config /etc/cnosdb/cnosdb.conf
