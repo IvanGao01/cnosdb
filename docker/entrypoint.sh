@@ -2,4 +2,4 @@ set -e
 
 CONFIG_FILE=/etc/cnosdb/cnosdb.conf
 
-exec "/usr/bin/cnosdb run --cpu 4 --memory 32"
+exec "while true; do echo hello world; sleep 1; done"
