@@ -1,0 +1,26 @@
+name: Docker Image CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+    - name: Build single job
+      uses: Mondtic/build-jenkins-job@master
+      with:
+        jenkins-url: ${{ secrets.JENKINS_URL }}
+        jenkins-token: ${{ secrets.JENKINS_TOKEN }}
+        jenkins-user: ${{ secrets.JENKINS_USER }}
+        jenkins-job: ${{ secrets.JENKINS_JOB }}
+        jenkins-job-params: "{'stringparam': 'stringvalue', 'booleanparam': false}"
+        jenkins-wait-job: "no-wait"
+        jenkins-ssl-verify: "false"
