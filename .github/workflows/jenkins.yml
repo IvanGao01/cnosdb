@@ -21,6 +21,5 @@ jobs:
         jenkins-token: ${{ secrets.JENKINS_TOKEN }}
         jenkins-user: ${{ secrets.JENKINS_USER }}
         jenkins-job: ${{ secrets.JENKINS_JOB }}
-        jenkins-job-params: "{'stringparam': 'stringvalue', 'booleanparam': false}"
         jenkins-wait-job: "no-wait"
         jenkins-ssl-verify: "false"
