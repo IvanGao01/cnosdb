@@ -1,24 +1,25 @@
-name: Jenkins CI
+name: jenkins-CI
 
+# Controls when the workflow will run
 on:
+  # Triggers the workflow on push or pull request events but only for the main branch
   push:
-    branches: [ "main" ]
+    branches: [ main ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ main ]
 
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-
+  # This workflow contains a single job called "build"
   build:
-
+    name: Build
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v3
-    - name: Build single job
-      uses: Mondtic/build-jenkins-job@master
-      with:
-        jenkins-url: ${{ secrets.JENKINS_URL }}
-        jenkins-token: ${{ secrets.JENKINS_TOKEN }}
-        jenkins-user: ${{ secrets.JENKINS_USER }}
-        jenkins-job: ${{ secrets.JENKINS_JOB }}
-        jenkins-ssl-verify: "false"
+      - name: Trigger jenkins job
+        uses: joshlk/jenkins-githubaction@master
+        with:
+          url: https://jenkins.cnosdb.com
+          job_name: ${{ secrets.JENKINS_JOB }}
+          username: ${{ secrets.JENKINS_USER }}
+          api_token: ${{ secrets.JENKINS_TOKEN }}
+          timeout: "1000"
