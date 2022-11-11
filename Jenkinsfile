@@ -60,5 +60,18 @@ pipeline {
             }
         }
 
+        stage('benchmark') {
+            steps {
+                sh """
+                cd $WORKSPACE
+                curl -o generate_data -L https://github.com/cnosdb/tsdb-comparisons/releases/download/v0.1.0/generate_data_linux_amd64
+                curl -o load_cnosdb -L https://github.com/cnosdb/tsdb-comparisons/releases/download/v0.1.0/load_cnosdb_linux_amd64
+                chmod +x generate_data
+                chmod +x load_cnosdb
+                bash ./ci/script/start_and_benchmark.sh
+                """
+            }
+        }
+
 	}
 }
