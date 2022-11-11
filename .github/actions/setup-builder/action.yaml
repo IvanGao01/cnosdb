@@ -11,9 +11,8 @@ runs:
     - name: Install Build Dependencies
       shell: bash
       run: |
-        git clone https://github.com/google/flatbuffers.git
-        cd flatbuffers
-        git checkout v2.0.6
+        wget https://github.com/google/flatbuffers/archive/refs/tags/v2.0.7.tar.gz
+        cd flatbuffers-2.0.7
         cmake .
         make
         sudo make install
