@@ -21,5 +21,4 @@ jobs:
         jenkins-token: ${{ secrets.JENKINS_TOKEN }}
         jenkins-user: ${{ secrets.JENKINS_USER }}
         jenkins-job: ${{ secrets.JENKINS_JOB }}
-        jenkins-wait-job: "no-wait"
         jenkins-ssl-verify: "false"
