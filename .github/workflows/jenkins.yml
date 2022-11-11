@@ -19,5 +19,5 @@ jobs:
         jenkins-token: ${{ secrets.JENKINS_TOKEN }}
         jenkins-user: ${{ secrets.JENKINS_USER }}
         jenkins-job: ${{ secrets.JENKINS_JOB }}
-        jenkins-job-params: ${{GITHUB_PR_NUMBER}}
+        jenkins-job-params: ${{ GITHUB_PR_NUMBER }}
         jenkins-ssl-verify: "false"
