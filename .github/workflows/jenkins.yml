@@ -6,6 +6,8 @@ on:
   pull_request:
     types: [opened, reopened]
     branches: [ "jenkins" ]
+env:
+  GITHUB_PR_NUMBER: ${{github.event.pull_request.number}}
 jobs:
   prJob:    
     name: Print event
@@ -13,3 +15,16 @@ jobs:
     steps:
       - run: |
           env
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Build single job
+      uses: IvanGao01/build-jenkins-job@master
+      with:
+        jenkins-url: ${{ secrets.JENKINS_URL }}
+        jenkins-token: ${{ secrets.JENKINS_TOKEN }}
+        jenkins-user: ${{ secrets.JENKINS_USER }}
+        jenkins-job: ${{ secrets.JENKINS_JOB }}
+        jenkins-wait-job: "wait"
+        jenkins-ssl-verify: "false"
