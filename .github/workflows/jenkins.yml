@@ -7,7 +7,7 @@ on:
     types: [opened, reopened]
     branches: [ "jenkins" ]
 env:
-  GITHUB_PR_NUMBER: "{\"stringparam\": \"${{github.event.pull_request.number}}\"}"
+  GITHUB_PR_NUMBER: ${{github.event.pull_request.number}}
 jobs:
   prJob:    
     name: Print event
@@ -26,6 +26,6 @@ jobs:
         jenkins-token: ${{ secrets.JENKINS_TOKEN }}
         jenkins-user: ${{ secrets.JENKINS_USER }}
         jenkins-job: ${{ secrets.JENKINS_JOB }}
-        jenkins-job-params: ${{ GITHUB_PR_NUMBER }}
+        jenkins-job-params: "{\"stringparam\": \"${{ GITHUB_PR_NUMBER }}\"}"
         jenkins-wait-job: "wait"
         jenkins-ssl-verify: "false"
