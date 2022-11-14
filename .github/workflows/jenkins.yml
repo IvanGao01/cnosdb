@@ -2,20 +2,21 @@ name: Jenkins CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "jenkins" ]
   pull_request:
-    branches: [ "main" ]
+    types: [opened, reopened]
+    branches: [ "jenkins" ]
 env:
   GITHUB_PR_NUMBER: ${{github.event.pull_request.number}}
 jobs:
   prJob:    
     name: Print event
-    runs-on: self-hosted
+    runs-on: ubuntu:latest
     steps:
       - run: |
           echo "$GITHUB_PR_NUMBER"
   build:
-    runs-on: self-hosted
+    runs-on: ubuntu:latest
     steps:
     - uses: actions/checkout@v3
     - name: Build single job
