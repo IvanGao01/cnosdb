@@ -28,3 +28,4 @@ jobs:
         jenkins-job: ${{ secrets.JENKINS_JOB }}
         jenkins-wait-job: "wait"
         jenkins-ssl-verify: "false"
+        jenkins-job-params: "{\"stringparam\": \"199\"}"
