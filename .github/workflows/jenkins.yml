@@ -11,12 +11,12 @@ env:
 jobs:
   prJob:    
     name: Print event
-    runs-on: ubuntu:latest
+    runs-on: ubuntu-latest
     steps:
       - run: |
           echo "$GITHUB_PR_NUMBER"
   build:
-    runs-on: ubuntu:latest
+    runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v3
     - name: Build single job
