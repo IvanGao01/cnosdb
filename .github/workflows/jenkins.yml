@@ -28,4 +28,4 @@ jobs:
         jenkins-job: ${{ secrets.JENKINS_JOB }}
         jenkins-wait-job: "wait"
         jenkins-ssl-verify: "false"
-        github-pr-number: ${{ GITHUB_PR_NUMBER }}
+        github-pr-number: ${{ env.GITHUB_PR_NUMBER }}
