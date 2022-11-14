@@ -29,4 +29,3 @@ jobs:
         jenkins-wait-job: "wait"
         jenkins-ssl-verify: "false"
         jenkins-job-params: "{\"GITHUB_PR_NUMBER\": \"199\"}"
-        
