@@ -1,0 +1,32 @@
+name: Jenkins CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    types: [opened, reopened]
+    branches: [ "main" ]
+env:
+  GITHUB_PR_NUMBER: ${{github.event.pull_request.number}}
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+jobs:
+  prJob:    
+    name: Print event
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          env
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Build single job
+      uses: IvanGao01/build-jenkins-job@master
+      with:
+        jenkins-url: ${{ secrets.JENKINS_URL }}
+        jenkins-token: ${{ secrets.JENKINS_TOKEN }}
+        jenkins-user: ${{ secrets.JENKINS_USER }}
+        jenkins-job: ${{ secrets.JENKINS_JOB }}
+        jenkins-wait-job: "wait"
+        jenkins-ssl-verify: "false"
+        github-pr-number: ${{ env.GITHUB_PR_NUMBER }}
