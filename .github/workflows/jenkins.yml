@@ -8,6 +8,7 @@ on:
     branches: [ "jenkins" ]
 env:
   GITHUB_PR_NUMBER: ${{github.event.pull_request.number}}
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 jobs:
   prJob:    
     name: Print event
