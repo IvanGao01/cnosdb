@@ -1,0 +1,20 @@
+name: Jenkins CI
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    types: [opened, reopened]
+    branches: [ "main" ]
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Setup test
+      uses: shihyuho/go-jenkins-trigger@v1
+      with:
+        jenkins-url: "${{ secrets.JENKINS_URL }}"
+        jenkins-user: "${{ secrets.JENKINS_USER }}"
+        jenkins-pat: "${{ secrets.JENKINS_TOKEN }}"
+        job: "TEST_CI"
+        params: "pull_request_number=${{ github.event.pull_request.number }}"
+        max-attempts: "300"
