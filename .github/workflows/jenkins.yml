@@ -1,4 +1,5 @@
 name: Jenkins CI
+
 on:
   push:
     branches: [ "main" ]
@@ -11,12 +12,12 @@ jobs:
     steps:
     - uses: actions/checkout@v3
     - name: Build single job
-      uses: Mondtic/build-jenkins-job@master
+      uses: IvanGao01/build-jenkins-job@master
       with:
         jenkins-url: ${{ secrets.JENKINS_URL }}
         jenkins-token: ${{ secrets.JENKINS_TOKEN }}
         jenkins-user: ${{ secrets.JENKINS_USER }}
         jenkins-job: ${{ secrets.JENKINS_JOB }}
-        jenkins-job-params: "pull_request_number=${{ github.event.pull_request.number }}"
         jenkins-wait-job: "wait"
-        jenkins-ssl-verify: "true"
+        jenkins-ssl-verify: "false"
+        github-pr-number: ${{ github.event.pull_request.number }}
