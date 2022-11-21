@@ -19,3 +19,4 @@ jobs:
         job: "TEST_CI"
         params: "pull_request_number=${{ github.event.pull_request.number }}"
         max-attempts: "300"
+        insecure: "true"
