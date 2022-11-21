@@ -10,13 +10,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v3
-    - name: Setup test
-      uses: shihyuho/go-jenkins-trigger@v1
+    - name: Build single job
+      uses: Mondtic/build-jenkins-job@master
       with:
-        jenkins-url: "${{ secrets.JENKINS_URL }}"
-        jenkins-user: "${{ secrets.JENKINS_USER }}"
-        jenkins-pat: "${{ secrets.JENKINS_TOKEN }}"
-        job: "TEST_CI"
-        params: "pull_request_number=${{ github.event.pull_request.number }}"
-        max-attempts: "300"
-        insecure: "true"
+        jenkins-url: ${{ secrets.JENKINS_URL }}
+        jenkins-token: ${{ secrets.JENKINS_TOKEN }}
+        jenkins-user: ${{ secrets.JENKINS_USER }}
+        jenkins-job: ${{ secrets.JENKINS_JOB }}
+        jenkins-job-params: "pull_request_number=${{ github.event.pull_request.number }}"
+        jenkins-wait-job: "wait"
+        jenkins-ssl-verify: "true"
