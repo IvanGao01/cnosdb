@@ -1,3 +1,18 @@
+[package]
+name = "cnosdb"
+license = "GPL-3.0"
+authors = ["CnosDB Team"]
+categories = ["database"]
+description = "CnosDB is a high-performance, high-compression, and easy-to-use open-source distributed time-series database."
+homepage = "https://www.cnosdb.com"
+readme = "README.md"
+repository = "https://github.com/cnosdb/cnosdb"
+version = "2.1.0"
+
+[[bin]]
+path = "main/src/main.rs"
+name = "cnosdb"
+
 [workspace]
 members = [
     "common/models",
@@ -159,3 +174,19 @@ panic = 'unwind'
 incremental = false
 overflow-checks = false
 debug = false
+
+
+[package.metadata.generate-rpm]
+
+assets = [
+    {source = "target/release/cnosdb", dest = "/usr/bin/cnosdb"},
+    {source = "target/release/cnosdb-cli", dest = "/usr/bin/cnosdb-cli"},
+    {source = "config/sample.toml", dest = "/etc/cnosdb/cnosdb.conf", config = true}
+]
+release = ""
+pre_install_script = ""
+pre_uninstall_script = ""
+post_install_script = ""
+post_uninstall_script = ""
+
+# ripgrep
