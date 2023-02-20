@@ -1,0 +1,7 @@
+version: "3"
+services:
+  build-package:
+    image: ubuntu:focal
+    container_name: build-package
+    volumes:
+      - /Users/ivan/Workspace/cnosdb:/cnosdb
