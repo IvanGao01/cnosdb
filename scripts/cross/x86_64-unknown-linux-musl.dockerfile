@@ -1,5 +1,7 @@
 FROM ghcr.io/cross-rs/x86_64-unknown-linux-musl:0.2.4
 
+
+ARG APT_KEY_DONT_WARN_ON_DANGEROUS_USAGE=1
 COPY scripts/cross/bootstrap-ubuntu.sh scripts/cross/pre-install.sh /
 RUN /bootstrap-ubuntu.sh && bash /pre-install.sh
 
