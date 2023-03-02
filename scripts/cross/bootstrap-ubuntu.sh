@@ -5,6 +5,7 @@ apt-get update
 apt-get install -y wget
 apt-get install -y git
 apt-get install -y unzip
+apt-get install -y gnupg
 
 cat <<-EOF > /etc/apt/sources.list.d/llvm.list
 deb http://apt.llvm.org/xenial/ llvm-toolchain-xenial-12 main
