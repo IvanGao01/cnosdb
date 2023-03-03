@@ -12,14 +12,20 @@ use actix_web::middleware::Logger;
 use actix_web::web::Data;
 use actix_web::{middleware, App, HttpServer};
 use clap::Parser;
+use config::TokioTrace;
 use meta::service::connection::Connections;
 use meta::service::{api, raft_api};
 use meta::store::config::Opt;
 use meta::store::Store;
 use meta::{store, MetaApp, RaftStore};
+use once_cell::sync::Lazy;
 use openraft::{Config, Raft};
+use parking_lot::{Mutex, Once};
 use sled::Db;
-use trace::init_global_tracing;
+use trace::{init_global_tracing, init_process_global_tracing, WorkerGuard};
+
+static GLOBAL_META_LOG_GUARD: Lazy<Arc<Mutex<Option<Vec<WorkerGuard>>>>> =
+    Lazy::new(|| Arc::new(Mutex::new(None)));
 
 #[derive(Debug, clap::Parser)]
 struct Cli {
@@ -32,9 +38,14 @@ struct Cli {
 async fn main() -> std::io::Result<()> {
     let cli = Cli::parse();
     let options = store::config::get_opt(cli.config);
-    let logs_path = format!("{}/{}", options.logs_path, options.id);
-    let _ = init_global_tracing(&logs_path, "meta_server.log", &options.logs_level);
-
+    let logs_path = format!("{}/{}", options.log.path, options.id);
+    init_process_global_tracing(
+        &logs_path,
+        &options.log.level,
+        "meta_server.log",
+        options.log.tokio_trace.as_ref(),
+        &GLOBAL_META_LOG_GUARD,
+    );
     start_service(options).await
 }
 
@@ -58,6 +69,7 @@ pub async fn start_service(opt: Opt) -> std::io::Result<()> {
     let config = config.validate().unwrap();
 
     let config = Arc::new(config);
+    let meta_init = Arc::new(opt.meta_init.clone());
     let es = get_sled_db(&opt);
     let store = Arc::new(Store::new(es));
 
@@ -70,6 +82,7 @@ pub async fn start_service(opt: Opt) -> std::io::Result<()> {
         raft,
         store,
         config,
+        meta_init,
     });
 
     let server = HttpServer::new(move || {

@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::slice;
 use std::sync::Arc;
+use std::time::Duration;
 
 use models::codec::Encoding;
 use models::schema::TskvTableSchema;
@@ -20,10 +21,11 @@ use tokio::select;
 use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::oneshot;
 use tokio::sync::oneshot::Sender as OneShotSender;
+use tokio::time::timeout;
 use trace::{debug, error, info, log_error, warn};
 use utils::BloomFilter;
 
-use crate::compaction::FlushReq;
+use crate::compaction::{CompactTask, FlushReq};
 use crate::context::GlobalContext;
 use crate::database::Database;
 use crate::error::{self, Error, Result};
@@ -128,12 +130,6 @@ impl FlushTask {
             edit.add_file(cm, max_level_ts);
         }
         version_edits.push(edit);
-
-        for mem in self.mem_caches.iter() {
-            // TODO Cache marked as flushed but there are no column files in current version.
-            //      May it turned to true after the new version inited?
-            mem.write().flushed = true;
-        }
 
         Ok(())
     }
@@ -367,9 +363,11 @@ pub async fn run_flush_memtable_job(
     global_context: Arc<GlobalContext>,
     version_set: Arc<tokio::sync::RwLock<VersionSet>>,
     summary_task_sender: Sender<SummaryTask>,
-    compact_task_sender: Sender<TseriesFamilyId>,
+    compact_task_sender: Option<Sender<CompactTask>>,
 ) -> Result<()> {
-    let mut tsf_caches: HashMap<TseriesFamilyId, Vec<Arc<RwLock<MemCache>>>> = HashMap::new();
+    let mut all_mems = vec![];
+    let mut tsf_caches: HashMap<TseriesFamilyId, Vec<Arc<RwLock<MemCache>>>> =
+        HashMap::with_capacity(req.mems.len());
     {
         info!("Flush: Running flush job on {} MemCaches", req.mems.len());
         if req.mems.is_empty() {
@@ -402,14 +400,20 @@ pub async fn run_flush_memtable_job(
             let path_tsm = storage_opt.tsm_dir(&database, tsf_id);
             let path_delta = storage_opt.delta_dir(&database, tsf_id);
 
-            FlushTask::new(caches, tsf_id, global_context.clone(), path_tsm, path_delta)
+            let flush_task =
+                FlushTask::new(caches, tsf_id, global_context.clone(), path_tsm, path_delta);
+            all_mems.extend(flush_task.mem_caches.clone());
+
+            flush_task
                 .run(version, &mut version_edits, &mut file_metas)
                 .await?;
 
             tsf.read().await.update_last_modfied().await;
 
-            if let Err(e) = compact_task_sender.send(tsf_id).await {
-                warn!("failed to send compact task({}), {}", tsf_id, e);
+            if let Some(sender) = compact_task_sender.as_ref() {
+                if let Err(e) = sender.send(CompactTask::Vnode(tsf_id)).await {
+                    warn!("failed to send compact task({}), {}", tsf_id, e);
+                }
             }
         }
     }
@@ -422,6 +426,17 @@ pub async fn run_flush_memtable_job(
     if let Err(e) = summary_task_sender.send(task).await {
         warn!("failed to send Summary task, {}", e);
     }
+
+    if timeout(Duration::from_secs(10), task_state_receiver)
+        .await
+        .is_ok()
+    {
+        all_mems.iter().for_each(|mem| mem.write().flushed = true)
+    } else {
+        error!("Failed recv summary call back, may case inconsistency of data temporarily");
+        all_mems.iter().for_each(|mem| mem.write().flushed = true)
+    }
+
     Ok(())
 }
 
@@ -432,7 +447,8 @@ pub mod flush_tests {
     use std::str::FromStr;
     use std::sync::Arc;
 
-    use lru_cache::ShardedCache;
+    use lru_cache::asynchronous::ShardedCache;
+    use memory_pool::{GreedyMemoryPool, MemoryPoolRef};
     use models::codec::Encoding;
     use models::schema::{ColumnType, TableColumn, TskvTableSchema};
     use models::{utils as model_utils, ColumnId, FieldId, Timestamp, ValueType};
@@ -447,14 +463,14 @@ pub mod flush_tests {
     use crate::memcache::test::put_rows_to_cache;
     use crate::memcache::{DataType, FieldVal, MemCache};
     use crate::summary::{CompactMeta, VersionEdit};
-    use crate::tseries_family::{LevelInfo, Version, FLUSH_REQ};
+    use crate::tseries_family::{LevelInfo, Version};
     use crate::tsm::codec::DataBlockEncoding;
     use crate::tsm::tsm_reader_tests::read_and_check;
     use crate::tsm::{DataBlock, TsmReader};
     use crate::version_set::VersionSet;
     use crate::{file_utils, tseries_family};
 
-    pub fn default_with_field_id(ids: Vec<ColumnId>) -> TskvTableSchema {
+    pub fn default_table_schema(ids: Vec<ColumnId>) -> TskvTableSchema {
         let fields = ids
             .iter()
             .map(|i| TableColumn {
@@ -476,8 +492,8 @@ pub mod flush_tests {
     #[test]
     fn test_sort_dedup() {
         #[rustfmt::skip]
-        let mut data = vec![
-            (1, 11), (1, 12), (2, 21), (3, 3), (2, 22), (4, 41), (4, 42)
+            let mut data = vec![
+            (1, 11), (1, 12), (2, 21), (3, 3), (2, 22), (4, 41), (4, 42),
         ];
         data.sort_by_key(|a| a.0);
         println!("{:?}", &data);
@@ -502,27 +518,27 @@ pub mod flush_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let tsm_dir = dir.join("tsm");
         let delta_dir = dir.join("delta");
-
+        let memory_pool: MemoryPoolRef = Arc::new(GreedyMemoryPool::new(1024 * 1024 * 1024));
         let mut caches = vec![
-            MemCache::new(1, 16, 0),
-            MemCache::new(1, 16, 0),
-            MemCache::new(1, 16, 0),
+            MemCache::new(1, 16, 0, &memory_pool),
+            MemCache::new(1, 16, 0, &memory_pool),
+            MemCache::new(1, 16, 0, &memory_pool),
         ];
 
         #[rustfmt::skip]
-        let _skip_fmt = {
-            put_rows_to_cache(&mut caches[0], 1, 1, default_with_field_id(vec![0, 1, 2]), (3, 4), false);
-            put_rows_to_cache(&mut caches[0], 1, 2, default_with_field_id(vec![0, 1, 3]), (1, 2), false);
-            put_rows_to_cache(&mut caches[0], 1, 3, default_with_field_id(vec![0, 1, 2, 3]), (5, 5), true);
-            put_rows_to_cache(&mut caches[0], 1, 3, default_with_field_id(vec![0, 1, 2, 3]), (5, 6), false);
-            put_rows_to_cache(&mut caches[1], 2, 1, default_with_field_id(vec![0, 1, 2]), (9, 10), false);
-            put_rows_to_cache(&mut caches[1], 2, 2, default_with_field_id(vec![0, 1, 3]), (7, 8), false);
-            put_rows_to_cache(&mut caches[1], 2, 3, default_with_field_id(vec![0, 1, 2, 3]), (11, 11), true);
-            put_rows_to_cache(&mut caches[1], 2, 3, default_with_field_id(vec![0, 1, 2, 3]), (11, 12), false);
-            put_rows_to_cache(&mut caches[2], 3, 1, default_with_field_id(vec![0, 1, 2]), (15, 16), false);
-            put_rows_to_cache(&mut caches[2], 3, 2, default_with_field_id(vec![0, 1, 3]), (13, 14), false);
-            put_rows_to_cache(&mut caches[2], 3, 3, default_with_field_id(vec![0, 1, 2, 3]), (17, 17), true);
-            put_rows_to_cache(&mut caches[2], 3, 3, default_with_field_id(vec![0, 1, 2, 3]), (17, 18), false);
+            let _skip_fmt = {
+            put_rows_to_cache(&mut caches[0], 1, 1, default_table_schema(vec![0, 1, 2]), (3, 4), false);
+            put_rows_to_cache(&mut caches[0], 1, 2, default_table_schema(vec![0, 1, 3]), (1, 2), false);
+            put_rows_to_cache(&mut caches[0], 1, 3, default_table_schema(vec![0, 1, 2, 3]), (5, 5), true);
+            put_rows_to_cache(&mut caches[0], 1, 3, default_table_schema(vec![0, 1, 2, 3]), (5, 6), false);
+            put_rows_to_cache(&mut caches[1], 2, 1, default_table_schema(vec![0, 1, 2]), (9, 10), false);
+            put_rows_to_cache(&mut caches[1], 2, 2, default_table_schema(vec![0, 1, 3]), (7, 8), false);
+            put_rows_to_cache(&mut caches[1], 2, 3, default_table_schema(vec![0, 1, 2, 3]), (11, 11), true);
+            put_rows_to_cache(&mut caches[1], 2, 3, default_table_schema(vec![0, 1, 2, 3]), (11, 12), false);
+            put_rows_to_cache(&mut caches[2], 3, 1, default_table_schema(vec![0, 1, 2]), (15, 16), false);
+            put_rows_to_cache(&mut caches[2], 3, 2, default_table_schema(vec![0, 1, 3]), (13, 14), false);
+            put_rows_to_cache(&mut caches[2], 3, 3, default_table_schema(vec![0, 1, 2, 3]), (17, 17), true);
+            put_rows_to_cache(&mut caches[2], 3, 3, default_table_schema(vec![0, 1, 2, 3]), (17, 18), false);
             "skip_fmt"
         };
 
@@ -541,15 +557,15 @@ pub mod flush_tests {
         // Col_2: None, None, 9,    10
         // Col_3: 7,    8,    None, None
         #[rustfmt::skip]
-        let expected_delta_data: HashMap<FieldId, Vec<DataBlock>> = HashMap::from([
-            (model_utils::unite_id(0, 1), vec![DataBlock::F64{ts: vec![1, 2, 3, 4, 5, 6], val: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], enc: DataBlockEncoding::default()}]),
-            (model_utils::unite_id(1, 1), vec![DataBlock::F64{ts: vec![1, 2, 3, 4, 5, 6], val: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], enc: DataBlockEncoding::default()}]),
-            (model_utils::unite_id(2, 1), vec![DataBlock::F64{ts: vec![3, 4, 5, 6], val: vec![3.0, 4.0, 5.0, 6.0], enc: DataBlockEncoding::default()}]),
-            (model_utils::unite_id(3, 1), vec![DataBlock::F64{ts: vec![1, 2, 5, 6], val: vec![1.0, 2.0, 5.0, 6.0], enc: DataBlockEncoding::default()}]),
-            (model_utils::unite_id(0, 2), vec![DataBlock::F64{ts: vec![7, 8, 9, 10], val: vec![7.0, 8.0, 9.0, 10.0], enc: DataBlockEncoding::default()}]),
-            (model_utils::unite_id(1, 2), vec![DataBlock::F64{ts: vec![7, 8, 9, 10], val: vec![7.0, 8.0, 9.0, 10.0], enc: DataBlockEncoding::default()}]),
-            (model_utils::unite_id(2, 2), vec![DataBlock::F64{ts: vec![9, 10], val: vec![9.0, 10.0], enc: DataBlockEncoding::default()}]),
-            (model_utils::unite_id(3, 2), vec![DataBlock::F64{ts: vec![7, 8], val: vec![7.0, 8.0], enc: DataBlockEncoding::default()}]),
+            let expected_delta_data: HashMap<FieldId, Vec<DataBlock>> = HashMap::from([
+            (model_utils::unite_id(0, 1), vec![DataBlock::F64 { ts: vec![1, 2, 3, 4, 5, 6], val: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], enc: DataBlockEncoding::default() }]),
+            (model_utils::unite_id(1, 1), vec![DataBlock::F64 { ts: vec![1, 2, 3, 4, 5, 6], val: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], enc: DataBlockEncoding::default() }]),
+            (model_utils::unite_id(2, 1), vec![DataBlock::F64 { ts: vec![3, 4, 5, 6], val: vec![3.0, 4.0, 5.0, 6.0], enc: DataBlockEncoding::default() }]),
+            (model_utils::unite_id(3, 1), vec![DataBlock::F64 { ts: vec![1, 2, 5, 6], val: vec![1.0, 2.0, 5.0, 6.0], enc: DataBlockEncoding::default() }]),
+            (model_utils::unite_id(0, 2), vec![DataBlock::F64 { ts: vec![7, 8, 9, 10], val: vec![7.0, 8.0, 9.0, 10.0], enc: DataBlockEncoding::default() }]),
+            (model_utils::unite_id(1, 2), vec![DataBlock::F64 { ts: vec![7, 8, 9, 10], val: vec![7.0, 8.0, 9.0, 10.0], enc: DataBlockEncoding::default() }]),
+            (model_utils::unite_id(2, 2), vec![DataBlock::F64 { ts: vec![9, 10], val: vec![9.0, 10.0], enc: DataBlockEncoding::default() }]),
+            (model_utils::unite_id(3, 2), vec![DataBlock::F64 { ts: vec![7, 8], val: vec![7.0, 8.0], enc: DataBlockEncoding::default() }]),
         ]);
 
         // | === SeriesId: 2 === |
@@ -565,15 +581,15 @@ pub mod flush_tests {
         // Col_2: None, None, 15,   16,   None, 17, 18
         // Col_3: 13,   14,   None, None, None, 17, 18
         #[rustfmt::skip]
-        let expected_tsm_data: HashMap<FieldId, Vec<DataBlock>> = HashMap::from([
-            (model_utils::unite_id(0, 2), vec![DataBlock::F64{ts: vec![11, 12], val: vec![11.0, 12.0], enc: DataBlockEncoding::default()}]),
-            (model_utils::unite_id(1, 2), vec![DataBlock::F64{ts: vec![11, 12], val: vec![11.0, 12.0], enc: DataBlockEncoding::default()}]),
-            (model_utils::unite_id(2, 2), vec![DataBlock::F64{ts: vec![11, 12], val: vec![11.0, 12.0], enc: DataBlockEncoding::default()}]),
-            (model_utils::unite_id(3, 2), vec![DataBlock::F64{ts: vec![11, 12], val: vec![11.0, 12.0], enc: DataBlockEncoding::default()}]),
-            (model_utils::unite_id(0, 3), vec![DataBlock::F64{ts: vec![13, 14, 15, 16, 17, 18], val: vec![13.0, 14.0, 15.0, 16.0, 17.0, 18.0], enc: DataBlockEncoding::default()}]),
-            (model_utils::unite_id(1, 3), vec![DataBlock::F64{ts: vec![13, 14, 15, 16, 17, 18], val: vec![13.0, 14.0, 15.0, 16.0, 17.0, 18.0], enc: DataBlockEncoding::default()}]),
-            (model_utils::unite_id(2, 3), vec![DataBlock::F64{ts: vec![15, 16, 17, 18], val: vec![15.0, 16.0, 17.0, 18.0], enc: DataBlockEncoding::default()}]),
-            (model_utils::unite_id(3, 3), vec![DataBlock::F64{ts: vec![13, 14, 17, 18], val: vec![13.0, 14.0, 17.0, 18.0], enc: DataBlockEncoding::default()}]),
+            let expected_tsm_data: HashMap<FieldId, Vec<DataBlock>> = HashMap::from([
+            (model_utils::unite_id(0, 2), vec![DataBlock::F64 { ts: vec![11, 12], val: vec![11.0, 12.0], enc: DataBlockEncoding::default() }]),
+            (model_utils::unite_id(1, 2), vec![DataBlock::F64 { ts: vec![11, 12], val: vec![11.0, 12.0], enc: DataBlockEncoding::default() }]),
+            (model_utils::unite_id(2, 2), vec![DataBlock::F64 { ts: vec![11, 12], val: vec![11.0, 12.0], enc: DataBlockEncoding::default() }]),
+            (model_utils::unite_id(3, 2), vec![DataBlock::F64 { ts: vec![11, 12], val: vec![11.0, 12.0], enc: DataBlockEncoding::default() }]),
+            (model_utils::unite_id(0, 3), vec![DataBlock::F64 { ts: vec![13, 14, 15, 16, 17, 18], val: vec![13.0, 14.0, 15.0, 16.0, 17.0, 18.0], enc: DataBlockEncoding::default() }]),
+            (model_utils::unite_id(1, 3), vec![DataBlock::F64 { ts: vec![13, 14, 15, 16, 17, 18], val: vec![13.0, 14.0, 15.0, 16.0, 17.0, 18.0], enc: DataBlockEncoding::default() }]),
+            (model_utils::unite_id(2, 3), vec![DataBlock::F64 { ts: vec![15, 16, 17, 18], val: vec![15.0, 16.0, 17.0, 18.0], enc: DataBlockEncoding::default() }]),
+            (model_utils::unite_id(3, 3), vec![DataBlock::F64 { ts: vec![13, 14, 17, 18], val: vec![13.0, 14.0, 17.0, 18.0], enc: DataBlockEncoding::default() }]),
         ]);
 
         let ts_family_id = 1;
@@ -586,9 +602,12 @@ pub mod flush_tests {
         let global_context = Arc::new(GlobalContext::new());
         let options = Options::from(&config);
         #[rustfmt::skip]
-        let version = Arc::new(Version {
-            ts_family_id, database: database.clone(), storage_opt: options.storage.clone(),
-            last_seq: 1, max_level_ts,
+            let version = Arc::new(Version {
+            ts_family_id,
+            database: database.clone(),
+            storage_opt: options.storage.clone(),
+            last_seq: 1,
+            max_level_ts,
             levels_info: LevelInfo::init_levels(database, 0, options.storage),
             tsm_reader_cache: Arc::new(ShardedCache::with_capacity(1)),
         });

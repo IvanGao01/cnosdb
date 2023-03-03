@@ -1,7 +1,3 @@
-mod bytes_num;
-mod duration;
-pub mod limiter_config;
-
 use std::fs::File;
 use std::io::prelude::Read;
 use std::path::Path;
@@ -9,6 +5,10 @@ use std::time::Duration;
 
 pub use limiter_config::*;
 use serde::{Deserialize, Serialize};
+
+mod bytes_num;
+mod duration;
+pub mod limiter_config;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Config {
@@ -21,7 +21,7 @@ pub struct Config {
     pub log: LogConfig,
     pub security: SecurityConfig,
     pub cluster: ClusterConfig,
-    pub hintedoff: HintedOffConfig,
+    pub hinted_off: HintedOffConfig,
 }
 
 impl Config {
@@ -47,7 +47,7 @@ pub fn get_config(path: impl AsRef<Path>) -> Config {
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(err) => panic!(
-            "Failed to open configurtion file '{}': {}",
+            "Failed to open configurtion file '{}': {:?}",
             path.display(),
             err
         ),
@@ -55,19 +55,20 @@ pub fn get_config(path: impl AsRef<Path>) -> Config {
     let mut content = String::new();
     if let Err(err) = file.read_to_string(&mut content) {
         panic!(
-            "Failed to read configurtion file '{}': {}",
+            "Failed to read configurtion file '{}': {:?}",
             path.display(),
             err
         );
     }
-    let config: Config = match toml::from_str(&content) {
+    let mut config: Config = match toml::from_str(&content) {
         Ok(config) => config,
         Err(err) => panic!(
-            "Failed to parse configurtion file '{}': {}",
+            "Failed to parse configurtion file '{}': {:?}",
             path.display(),
             err
         ),
     };
+    config.wal.introspect();
     config
 }
 
@@ -80,11 +81,11 @@ pub fn default_config() -> Config {
     [log]
     [security]
     [cluster]
-    [hintedoff]"#;
+    [hinted_off]"#;
 
     match toml::from_str(DEFAULT_CONFIG) {
         Ok(config) => config,
-        Err(err) => panic!("Failed to get default configurtion : {}", err),
+        Err(err) => panic!("Failed to get default configurtion: {:?}", err),
     }
 }
 
@@ -261,6 +262,8 @@ pub struct WalConfig {
     pub max_file_size: u64,
     #[serde(default = "WalConfig::default_sync")]
     pub sync: bool,
+    #[serde(with = "duration", default = "WalConfig::default_sync_interval")]
+    pub sync_interval: Duration,
 }
 
 impl WalConfig {
@@ -284,6 +287,10 @@ impl WalConfig {
         false
     }
 
+    fn default_sync_interval() -> Duration {
+        Duration::from_secs(0)
+    }
+
     pub fn override_by_env(&mut self) {
         if let Ok(cap) = std::env::var("CNOSDB_WAL_REQ_CHANNEL_CAP") {
             self.wal_req_channel_cap = cap.parse::<usize>().unwrap();
@@ -297,6 +304,11 @@ impl WalConfig {
         if let Ok(sync) = std::env::var("CNOSDB_WAL_SYNC") {
             self.sync = sync.as_str() == sync;
         }
+    }
+
+    pub fn introspect(&mut self) {
+        // Unit of wal.sync_interval is seconds
+        self.sync_interval = Duration::from_secs(self.sync_interval.as_secs());
     }
 }
 
@@ -328,11 +340,17 @@ impl CacheConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TokioTrace {
+    pub addr: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LogConfig {
     #[serde(default = "LogConfig::default_level")]
     pub level: String,
     #[serde(default = "LogConfig::default_path")]
     pub path: String,
+    pub tokio_trace: Option<TokioTrace>,
 }
 
 impl LogConfig {
@@ -385,17 +403,15 @@ pub struct ClusterConfig {
     pub name: String,
     #[serde(default = "ClusterConfig::default_meta_service_addr")]
     pub meta_service_addr: String,
-    #[serde(default = "ClusterConfig::default_tenant")]
-    pub tenant: String,
 
     #[serde(default = "ClusterConfig::default_http_listen_addr")]
     pub http_listen_addr: String,
     #[serde(default = "ClusterConfig::default_grpc_listen_addr")]
     pub grpc_listen_addr: String,
-    #[serde(default = "ClusterConfig::default_tcp_listen_addr")]
-    pub tcp_listen_addr: String,
     #[serde(default = "ClusterConfig::default_flight_rpc_listen_addr")]
     pub flight_rpc_listen_addr: String,
+    #[serde(default = "ClusterConfig::default_store_metrics")]
+    pub store_metrics: bool,
 }
 
 impl ClusterConfig {
@@ -411,10 +427,6 @@ impl ClusterConfig {
         "127.0.0.1:21001".to_string()
     }
 
-    fn default_tenant() -> String {
-        "".to_string()
-    }
-
     fn default_http_listen_addr() -> String {
         "127.0.0.1:31007".to_string()
     }
@@ -423,12 +435,12 @@ impl ClusterConfig {
         "127.0.0.1:31008".to_string()
     }
 
-    fn default_tcp_listen_addr() -> String {
-        "127.0.0.1:31009".to_string()
-    }
-
     fn default_flight_rpc_listen_addr() -> String {
         "127.0.0.1:31006".to_string()
+    }
+
+    fn default_store_metrics() -> bool {
+        true
     }
 
     pub fn override_by_env(&mut self) {
@@ -437,9 +449,6 @@ impl ClusterConfig {
         }
         if let Ok(meta) = std::env::var("CNOSDB_CLUSTER_META") {
             self.meta_service_addr = meta;
-        }
-        if let Ok(tenant) = std::env::var("CNOSDB_TENANT_NAME") {
-            self.tenant = tenant;
         }
         if let Ok(id) = std::env::var("CNOSDB_NODE_ID") {
             self.node_id = id.parse::<u64>().unwrap();
@@ -451,10 +460,6 @@ impl ClusterConfig {
 
         if let Ok(val) = std::env::var("CNOSDB_grpc_listen_addr") {
             self.grpc_listen_addr = val;
-        }
-
-        if let Ok(val) = std::env::var("CNOSDB_tcp_listen_addr") {
-            self.tcp_listen_addr = val;
         }
 
         if let Ok(val) = std::env::var("CNOSDB_flight_rpc_listen_addr") {
@@ -570,7 +575,7 @@ max_file_size = "1G" # 1073741824
 
 # If true, fsync will be called after every wal writes.
 sync = false
-sync_interval = "0" # h, m, s
+sync_interval = "10s" # h, m, s
 
 [cache]
 max_buffer_size = "128M" # 134217728
@@ -594,9 +599,8 @@ tenant = ''
 flight_rpc_listen_addr = '127.0.0.1:31006'
 http_listen_addr = '127.0.0.1:31007'
 grpc_listen_addr = '127.0.0.1:31008'
-tcp_listen_addr = '127.0.0.1:31009'
 
-[hintedoff]
+[hinted_off]
 enable = true
 path = '/tmp/cnosdb/hh'
 "#;

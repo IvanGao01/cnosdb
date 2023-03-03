@@ -42,6 +42,10 @@ pub enum Error {
         source: SchemaError,
     },
 
+    #[snafu(display("Memory Exhausted Retry Later"))]
+    #[error_code(code = 5)]
+    MemoryExhausted,
+
     // Internal Error
     #[snafu(display("{}", source))]
     IO {
@@ -159,6 +163,12 @@ impl From<SchemaError> for Error {
 impl From<IndexError> for Error {
     fn from(value: IndexError) -> Self {
         Error::IndexErr { source: value }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(value: std::io::Error) -> Self {
+        Error::IO { source: value }
     }
 }
 

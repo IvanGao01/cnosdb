@@ -1,16 +1,19 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::panic;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 
 use config::ClusterConfig;
-use datafusion::prelude::Column;
 use flatbuffers::FlatBufferBuilder;
 use futures::stream::SelectNextSome;
 use futures::FutureExt;
 use libc::printf;
+use memory_pool::{GreedyMemoryPool, MemoryPool, MemoryPoolRef};
 use meta::meta_manager::RemoteMetaManager;
 use meta::MetaRef;
+use metrics::metric_register::MetricsRegister;
 use metrics::{incr_compaction_failed, incr_compaction_success, sample_tskv_compaction_duration};
 use models::codec::Encoding;
 use models::predicate::domain::{ColumnDomains, PredicateRef};
@@ -23,6 +26,7 @@ use models::{
 };
 use protos::kv_service::{WritePointsRequest, WritePointsResponse};
 use protos::models as fb_models;
+use protos::models_helper::get_db_from_fb_points;
 use snafu::{OptionExt, ResultExt};
 use tokio::runtime::Runtime;
 use tokio::sync::broadcast::{self, Receiver as BroadcastReceiver, Sender as BroadcastSender};
@@ -32,7 +36,7 @@ use tokio::time::Instant;
 use trace::{debug, error, info, trace, warn};
 
 use crate::compaction::{
-    self, run_flush_memtable_job, CompactReq, FlushReq, LevelCompactionPicker, Picker,
+    self, run_flush_memtable_job, CompactReq, CompactTask, FlushReq, LevelCompactionPicker, Picker,
 };
 use crate::context::{self, GlobalContext, GlobalSequenceContext, GlobalSequenceTask};
 use crate::database::Database;
@@ -67,21 +71,29 @@ pub struct TsKv {
     meta_manager: MetaRef,
 
     runtime: Arc<Runtime>,
+    memory_pool: Arc<dyn MemoryPool>,
     wal_sender: Sender<WalTask>,
     flush_task_sender: Sender<FlushReq>,
-    compact_task_sender: Sender<TseriesFamilyId>,
+    compact_task_sender: Sender<CompactTask>,
     summary_task_sender: Sender<SummaryTask>,
     global_seq_task_sender: Sender<GlobalSequenceTask>,
     close_sender: BroadcastSender<Sender<()>>,
+    metrics: Arc<MetricsRegister>,
 }
 
 impl TsKv {
-    pub async fn open(meta_manager: MetaRef, opt: Options, runtime: Arc<Runtime>) -> Result<TsKv> {
+    pub async fn open(
+        meta_manager: MetaRef,
+        opt: Options,
+        runtime: Arc<Runtime>,
+        memory_pool: MemoryPoolRef,
+        metrics: Arc<MetricsRegister>,
+    ) -> Result<TsKv> {
         let shared_options = Arc::new(opt);
         let (flush_task_sender, flush_task_receiver) =
             mpsc::channel::<FlushReq>(shared_options.storage.flush_req_channel_cap);
         let (compact_task_sender, compact_task_receiver) =
-            mpsc::channel::<TseriesFamilyId>(COMPACT_REQ_CHANNEL_CAP);
+            mpsc::channel::<CompactTask>(COMPACT_REQ_CHANNEL_CAP);
         let (wal_sender, wal_receiver) =
             mpsc::channel::<WalTask>(shared_options.wal.wal_req_channel_cap);
         let (summary_task_sender, summary_task_receiver) =
@@ -91,16 +103,19 @@ impl TsKv {
         let (close_sender, _close_receiver) = broadcast::channel(1);
         let (version_set, summary) = Self::recover_summary(
             runtime.clone(),
+            memory_pool.clone(),
             meta_manager.clone(),
             shared_options.clone(),
             flush_task_sender.clone(),
             global_seq_task_sender.clone(),
             compact_task_sender.clone(),
+            metrics.clone(),
         )
         .await;
         let global_seq_ctx = version_set.read().await.get_global_sequence_context().await;
         let global_seq_ctx = Arc::new(global_seq_ctx);
         let wal_cfg = shared_options.wal.clone();
+
         let core = Self {
             options: shared_options.clone(),
             global_ctx: summary.global_context(),
@@ -108,12 +123,14 @@ impl TsKv {
             version_set,
             meta_manager,
             runtime: runtime.clone(),
+            memory_pool,
             wal_sender,
             flush_task_sender: flush_task_sender.clone(),
             compact_task_sender: compact_task_sender.clone(),
             summary_task_sender: summary_task_sender.clone(),
             global_seq_task_sender: global_seq_task_sender.clone(),
             close_sender,
+            metrics,
         };
 
         let wal_manager = core.recover_wal().await;
@@ -142,24 +159,16 @@ impl TsKv {
         Ok(core)
     }
 
-    pub async fn close(&self) {
-        let (tx, mut rx) = mpsc::channel(1);
-        if let Err(e) = self.close_sender.send(tx) {
-            error!("Failed to broadcast close signal: {:?}", e);
-        }
-        while let Some(_x) = rx.recv().await {
-            continue;
-        }
-        info!("TsKv closed");
-    }
-
+    #[allow(clippy::too_many_arguments)]
     async fn recover_summary(
         runtime: Arc<Runtime>,
+        memory_pool: MemoryPoolRef,
         meta: MetaRef,
         opt: Arc<Options>,
         flush_task_sender: Sender<FlushReq>,
         global_seq_task_sender: Sender<GlobalSequenceTask>,
-        compact_task_sender: Sender<TseriesFamilyId>,
+        compact_task_sender: Sender<CompactTask>,
+        metrics: Arc<MetricsRegister>,
     ) -> (Arc<RwLock<VersionSet>>, Summary) {
         let summary_dir = opt.storage.summary_dir();
         if !file_manager::try_exists(&summary_dir) {
@@ -177,11 +186,12 @@ impl TsKv {
                 global_seq_task_sender,
                 compact_task_sender,
                 true,
+                metrics.clone(),
             )
             .await
             .unwrap()
         } else {
-            Summary::new(opt, runtime, global_seq_task_sender)
+            Summary::new(opt, runtime, memory_pool, global_seq_task_sender, metrics)
                 .await
                 .unwrap()
         };
@@ -203,48 +213,79 @@ impl TsKv {
         wal_manager
     }
 
-    fn run_wal_job(&self, mut wal_manager: WalManager, mut receiver: Receiver<WalTask>) {
-        warn!("job 'WAL' starting.");
+    pub(crate) fn run_wal_job(&self, mut wal_manager: WalManager, mut receiver: Receiver<WalTask>) {
+        async fn on_write(
+            wal_manager: &mut WalManager,
+            points: Arc<Vec<u8>>,
+            cb: oneshot::Sender<Result<(u64, usize)>>,
+            id: TseriesFamilyId,
+            tenant: Arc<Vec<u8>>,
+        ) {
+            let ret = wal_manager
+                .write(WalEntryType::Write, points, id, tenant)
+                .await;
+            let send_ret = cb.send(ret);
+            if let Err(e) = send_ret {
+                warn!("send WAL write result failed: {:?}", e);
+            }
+        }
+
+        async fn on_tick(wal_manager: &WalManager) {
+            if let Err(e) = wal_manager.sync().await {
+                error!("Failed flushing WAL file: {:?}", e);
+            }
+        }
+
+        async fn on_cancel(wal_manager: WalManager) {
+            info!("Job 'WAL' closing.");
+            if let Err(e) = wal_manager.close().await {
+                error!("Failed to close job 'WAL': {:?}", e);
+            }
+            info!("Job 'WAL' closed.");
+        }
+
+        info!("Job 'WAL' starting.");
         let mut close_receiver = self.close_sender.subscribe();
-        let f = async move {
-            loop {
-                tokio::select! {
-                    wal_task = receiver.recv() => {
-                        match wal_task {
-                            Some(WalTask::Write { id, points, tenant, cb }) => {
-                                // write wal
-                                let ret = wal_manager.write(WalEntryType::Write, points, id, tenant).await;
-                                let send_ret = cb.send(ret);
-                                match send_ret {
-                                    Ok(wal_result) => {}
-                                    Err(err) => {
-                                        warn!("send WAL write result failed.")
-                                    }
-                                }
+        let _ = self.runtime.spawn(async move {
+            info!("Job 'WAL' started.");
+
+            let sync_interval = wal_manager.sync_interval();
+            if sync_interval == Duration::ZERO {
+                loop {
+                    tokio::select! {
+                        wal_task = receiver.recv() => {
+                            match wal_task {
+                                Some(WalTask::Write { id, points, tenant, cb }) => on_write(&mut wal_manager, points, cb, id, tenant).await,
+                                _ => break
                             }
-                            _ => {
-                                break;
-                            }
+                        }
+                        close_task = close_receiver.recv() => {
+                            on_cancel(wal_manager).await;
+                            break;
                         }
                     }
-                    close_task = close_receiver.recv() => {
-                        info!("job 'WAL' closing.");
-                        if let Err(e) = wal_manager.close().await {
-                            error!("Failed to close wal: {:?}", e);
-                        }
-                        info!("job 'WAL' closed.");
-                        if let Ok(tx) = close_task {
-                            if let Err(e) = tx.send(()).await {
-                                error!("Failed to send wal closed signal: {:?}", e);
+                }
+            } else {
+                let mut ticker = tokio::time::interval(sync_interval);
+                loop {
+                    tokio::select! {
+                        wal_task = receiver.recv() => {
+                            match wal_task {
+                                Some(WalTask::Write { id, points, tenant, cb }) => on_write(&mut wal_manager, points, cb, id, tenant).await,
+                                _ => break
                             }
                         }
-                        break;
+                        _ = ticker.tick() => {
+                            on_tick(&wal_manager).await;
+                        }
+                        close_task = close_receiver.recv() => {
+                            on_cancel(wal_manager).await;
+                            break;
+                        }
                     }
                 }
             }
-        };
-        self.runtime.spawn(f);
-        info!("job 'WAL' started.");
+        });
     }
 
     fn run_flush_job(
@@ -253,7 +294,7 @@ impl TsKv {
         ctx: Arc<GlobalContext>,
         version_set: Arc<RwLock<VersionSet>>,
         summary_task_sender: Sender<SummaryTask>,
-        compact_task_sender: Sender<TseriesFamilyId>,
+        compact_task_sender: Sender<CompactTask>,
     ) {
         let runtime = self.runtime.clone();
         let f = async move {
@@ -263,7 +304,7 @@ impl TsKv {
                     ctx.clone(),
                     version_set.clone(),
                     summary_task_sender.clone(),
-                    compact_task_sender.clone(),
+                    Some(compact_task_sender.clone()),
                 ));
             }
         };
@@ -283,24 +324,6 @@ impl TsKv {
         self.runtime.spawn(f);
         info!("Summary task handler started");
     }
-
-    // fn run_timer_job(&self, pub_sender: Sender<()>) {
-    //     let f = async move {
-    //         let interval = Duration::from_secs(1);
-    //         let ticker = crossbeam_channel::tick(interval);
-    //         loop {
-    //             ticker.recv().unwrap();
-    //             let _ = pub_sender.send(());
-    //         }
-    //     };
-    //     self.runtime.spawn(f);
-    // }
-
-    // pub async fn query(&self, _opt: QueryOption) -> Result<Option<Entry>> {
-    //     Ok(None)
-    // }
-
-    // Compact TSM files in database into bigger TSM files.
 
     pub async fn get_db(&self, tenant: &str, database: &str) -> Result<Arc<RwLock<Database>>> {
         let db = self
@@ -333,7 +356,11 @@ impl TsKv {
             .version_set
             .write()
             .await
-            .create_db(schema.clone(), self.meta_manager.clone())
+            .create_db(
+                schema.clone(),
+                self.meta_manager.clone(),
+                self.memory_pool.clone(),
+            )
             .await?;
         Ok(db)
     }
@@ -391,8 +418,7 @@ impl Engine for TsKv {
         let fb_points = flatbuffers::root::<fb_models::Points>(&points)
             .context(error::InvalidFlatbufferSnafu)?;
 
-        let db_name = String::from_utf8(fb_points.db().unwrap().bytes().to_vec())
-            .map_err(|err| Error::ErrCharacterSet)?;
+        let db_name = get_db_from_fb_points(fb_points);
 
         let db_warp = self.version_set.read().await.get_db(&tenant_name, &db_name);
         let db = match db_warp {
@@ -452,9 +478,12 @@ impl Engine for TsKv {
             }
         };
 
-        let size = tsf.read().await.put_points(seq, write_group);
+        let res = match tsf.read().await.put_points(seq, write_group) {
+            Ok(points_number) => Ok(WritePointsResponse { points_number }),
+            Err(err) => Err(err),
+        };
         tsf.write().await.check_to_flush().await;
-        Ok(WritePointsResponse { size })
+        res
     }
 
     async fn write_from_wal(
@@ -471,8 +500,7 @@ impl Engine for TsKv {
         let fb_points = flatbuffers::root::<fb_models::Points>(&points)
             .context(error::InvalidFlatbufferSnafu)?;
 
-        let db_name = String::from_utf8(fb_points.db().unwrap().bytes().to_vec())
-            .map_err(|err| Error::ErrCharacterSet)?;
+        let db_name = get_db_from_fb_points(fb_points);
 
         let db = self
             .version_set
@@ -481,6 +509,7 @@ impl Engine for TsKv {
             .create_db(
                 DatabaseSchema::new(&tenant_name, &db_name),
                 self.meta_manager.clone(),
+                self.memory_pool.clone(),
             )
             .await?;
 
@@ -514,8 +543,7 @@ impl Engine for TsKv {
             }
         };
 
-        tsf.read().await.put_points(seq, write_group);
-
+        tsf.read().await.put_points(seq, write_group)?;
         return Ok(());
     }
 
@@ -594,7 +622,7 @@ impl Engine for TsKv {
                         self.global_ctx.clone(),
                         self.version_set.clone(),
                         self.summary_task_sender.clone(),
-                        self.compact_task_sender.clone(),
+                        Some(self.compact_task_sender.clone()),
                     )
                     .await
                     .unwrap()
@@ -755,19 +783,20 @@ impl Engine for TsKv {
         vnode_id: u32,
     ) -> Result<Option<Arc<SuperVersion>>> {
         let version_set = self.version_set.read().await;
-        if !version_set.db_exists(tenant, database) {
-            return Err(SchemaError::DatabaseNotFound {
-                database: database.to_string(),
-            }
-            .into());
-        }
+        // Comment it, It's not a error, Maybe the data not right!
+        // if !version_set.db_exists(tenant, database) {
+        //     return Err(SchemaError::DatabaseNotFound {
+        //         database: database.to_string(),
+        //     }
+        //     .into());
+        // }
         if let Some(tsf) = version_set
             .get_tsfamily_by_name_id(tenant, database, vnode_id)
             .await
         {
             Ok(Some(tsf.read().await.super_version()))
         } else {
-            warn!("ts_family with db name '{}' not found.", database);
+            info!("ts_family with db name '{}' not found.", database);
             Ok(None)
         }
     }
@@ -880,11 +909,35 @@ impl Engine for TsKv {
         Ok(())
     }
 
-    async fn compact(&self, tenant: &str, database: &str) {
-        let database = self.version_set.read().await.get_db(tenant, database);
-        if let Some(db) = database {
-            // TODO: stop current and prevent next flush and compaction.
-            for (ts_family_id, ts_family) in db.read().await.ts_families() {
+    async fn compact(&self, vnode_ids: Vec<TseriesFamilyId>) -> Result<()> {
+        for vnode_id in vnode_ids {
+            if let Some(ts_family) = self
+                .version_set
+                .read()
+                .await
+                .get_tsfamily_by_tf_id(vnode_id)
+                .await
+            {
+                // TODO: stop current and prevent next flush and compaction.
+
+                let mut tsf_wlock = ts_family.write().await;
+                tsf_wlock.switch_to_immutable();
+                let flush_req = tsf_wlock.flush_req(true);
+                drop(tsf_wlock);
+                if let Some(req) = flush_req {
+                    if let Err(e) = run_flush_memtable_job(
+                        req,
+                        self.global_ctx.clone(),
+                        self.version_set.clone(),
+                        self.summary_task_sender.clone(),
+                        None,
+                    )
+                    .await
+                    {
+                        error!("Failed to flush vnode {}: {:?}", vnode_id, e);
+                    }
+                }
+
                 let picker = LevelCompactionPicker::new(self.options.storage.clone());
                 let version = ts_family.read().await.version();
                 if let Some(req) = picker.pick_compaction(version) {
@@ -911,6 +964,19 @@ impl Engine for TsKv {
                 }
             }
         }
+
+        Ok(())
+    }
+
+    async fn close(&self) {
+        let (tx, mut rx) = mpsc::channel(1);
+        if let Err(e) = self.close_sender.send(tx) {
+            error!("Failed to broadcast close signal: {:?}", e);
+        }
+        while let Some(_x) = rx.recv().await {
+            continue;
+        }
+        info!("TsKv closed");
     }
 }
 
@@ -924,43 +990,7 @@ impl TsKv {
         self.flush_task_sender.clone()
     }
 
-    pub(crate) fn compact_task_sender(&self) -> Sender<TseriesFamilyId> {
+    pub(crate) fn compact_task_sender(&self) -> Sender<CompactTask> {
         self.compact_task_sender.clone()
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use std::collections::HashMap;
-    use std::sync::atomic::{AtomicI64, Ordering};
-    use std::sync::{atomic, Arc};
-
-    use config::get_config;
-    use flatbuffers::{FlatBufferBuilder, WIPOffset};
-    use meta::meta_manager::RemoteMetaManager;
-    use meta::MetaRef;
-    use models::utils::now_timestamp;
-    use models::{ColumnId, InMemPoint, SeriesId, SeriesKey, Timestamp};
-    use protos::models::Points;
-    use protos::models_helper;
-    use tokio::runtime::{self, Runtime};
-    use tokio::sync::watch;
-
-    use crate::engine::Engine;
-    use crate::tsm::DataBlock;
-    use crate::{error, Options, TimeRange, TsKv};
-
-    #[tokio::test]
-    #[ignore]
-    async fn test_compact() {
-        trace::init_default_global_tracing("tskv_log", "tskv.log", "info");
-        let config = get_config("/tmp/test/config/config.toml");
-        let opt = Options::from(&config);
-        let meta_manager: MetaRef = RemoteMetaManager::new(config.cluster.clone()).await;
-        meta_manager.admin_meta().add_data_node().await.unwrap();
-        let tskv = TsKv::open(meta_manager, opt, Arc::new(Runtime::new().unwrap()))
-            .await
-            .unwrap();
-        tskv.compact("cnosdb", "public").await;
     }
 }

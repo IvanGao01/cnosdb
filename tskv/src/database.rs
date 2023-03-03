@@ -1,12 +1,18 @@
 use std::collections::HashMap;
 use std::mem::size_of;
 use std::path::{self, Path};
+use std::ptr::read;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use datafusion::sql::sqlparser::test_utils::table;
-use lru_cache::ShardedCache;
+use futures::executor::block_on;
+use lru_cache::asynchronous::ShardedCache;
+use memory_pool::{MemoryPool, MemoryPoolRef};
 use meta::MetaRef;
+use metrics::gauge::{GaugeWrap, U64Gauge};
+use metrics::metric::Metric;
+use metrics::metric_register::MetricsRegister;
 use models::schema::{DatabaseSchema, TableColumn, TableSchema, TskvTableSchema};
 use models::utils::{split_id, unite_id};
 use models::{
@@ -21,7 +27,7 @@ use tokio::sync::{oneshot, RwLock};
 use trace::{debug, error, info};
 use utils::BloomFilter;
 
-use crate::compaction::{check, FlushReq};
+use crate::compaction::{check, CompactTask, FlushReq};
 use crate::error::{self, IndexErrSnafu, Result, SchemaSnafu};
 use crate::index::{self, IndexResult};
 use crate::kv_option::Options;
@@ -45,6 +51,8 @@ pub struct Database {
     ts_indexes: HashMap<TseriesFamilyId, Arc<RwLock<index::ts_index::TSIndex>>>,
     ts_families: HashMap<TseriesFamilyId, Arc<RwLock<TseriesFamily>>>,
     runtime: Arc<Runtime>,
+    memory_pool: MemoryPoolRef,
+    metrics_register: Arc<MetricsRegister>,
 }
 
 impl Database {
@@ -53,6 +61,8 @@ impl Database {
         opt: Arc<Options>,
         runtime: Arc<Runtime>,
         meta: MetaRef,
+        memory_pool: MemoryPoolRef,
+        metrics_register: Arc<MetricsRegister>,
     ) -> Result<Self> {
         let db = Self {
             opt,
@@ -61,6 +71,8 @@ impl Database {
             ts_indexes: HashMap::new(),
             ts_families: HashMap::new(),
             runtime,
+            memory_pool,
+            metrics_register,
         };
 
         Ok(db)
@@ -70,21 +82,29 @@ impl Database {
         &mut self,
         ver: Arc<Version>,
         flush_task_sender: Sender<FlushReq>,
-        compact_task_sender: Sender<TseriesFamilyId>,
+        compact_task_sender: Sender<CompactTask>,
     ) {
         let opt = ver.storage_opt();
 
         let tf = TseriesFamily::new(
             ver.tf_id(),
             ver.database(),
-            MemCache::new(ver.tf_id(), self.opt.cache.max_buffer_size, ver.last_seq),
+            MemCache::new(
+                ver.tf_id(),
+                self.opt.cache.max_buffer_size,
+                ver.last_seq,
+                &self.memory_pool,
+            ),
             ver.clone(),
             self.opt.cache.clone(),
             self.opt.storage.clone(),
             flush_task_sender,
             compact_task_sender,
+            self.memory_pool.clone(),
+            &self.metrics_register,
         );
         tf.schedule_compaction(self.runtime.clone());
+
         self.ts_families
             .insert(ver.tf_id(), Arc::new(RwLock::new(tf)));
     }
@@ -95,6 +115,7 @@ impl Database {
                 tf_id,
                 self.opt.cache.max_buffer_size,
                 seq,
+                &self.memory_pool,
             )));
             let mut tf = tf.write().await;
             tf.switch_memcache(mem);
@@ -110,7 +131,7 @@ impl Database {
         version_edit: Option<VersionEdit>,
         summary_task_sender: Sender<SummaryTask>,
         flush_task_sender: Sender<FlushReq>,
-        compact_task_sender: Sender<TseriesFamilyId>,
+        compact_task_sender: Sender<CompactTask>,
     ) -> Arc<RwLock<TseriesFamily>> {
         let seq_no = version_edit.as_ref().map(|v| v.seq_no).unwrap_or(seq_no);
 
@@ -127,13 +148,21 @@ impl Database {
         let tf = TseriesFamily::new(
             tsf_id,
             self.owner.clone(),
-            MemCache::new(tsf_id, self.opt.cache.max_buffer_size, seq_no),
+            MemCache::new(
+                tsf_id,
+                self.opt.cache.max_buffer_size,
+                seq_no,
+                &self.memory_pool,
+            ),
             ver,
             self.opt.cache.clone(),
             self.opt.storage.clone(),
             flush_task_sender,
             compact_task_sender,
+            self.memory_pool.clone(),
+            &self.metrics_register,
         );
+
         let tf = Arc::new(RwLock::new(tf));
         self.ts_families.insert(tsf_id, tf.clone());
 

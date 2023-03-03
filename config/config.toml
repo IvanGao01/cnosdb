@@ -78,14 +78,12 @@ path = '/var/log/cnosdb'
 node_id = 100
 name = 'cluster_xxx'
 meta_service_addr = '127.0.0.1:21001'
-tenant = ''
 
 http_listen_addr = '127.0.0.1:31007'
 grpc_listen_addr = '127.0.0.1:31008'
-tcp_listen_addr = '127.0.0.1:31009'
 flight_rpc_listen_addr = '127.0.0.1:31006'
 
-[hintedoff]
+[hinted_off]
 enable = true
 path = '/var/lib/cnosdb/hh'
 

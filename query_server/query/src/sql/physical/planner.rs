@@ -17,10 +17,11 @@ use datafusion::physical_plan::planner::{
 };
 use datafusion::physical_plan::{ExecutionPlan, PhysicalPlanner as DFPhysicalPlanner};
 use spi::query::physical_planner::PhysicalPlanner;
-use spi::query::session::IsiphoSessionCtx;
+use spi::query::session::SessionCtx;
 use spi::Result;
 
 use super::optimizer::PhysicalOptimizer;
+use crate::extension::physical::transform_rule::expand::ExpandPlanner;
 use crate::extension::physical::transform_rule::table_writer::TableWriterPlanner;
 use crate::extension::physical::transform_rule::tag_scan::TagScanPlanner;
 
@@ -54,8 +55,11 @@ impl DefaultPhysicalPlanner {
 
 impl Default for DefaultPhysicalPlanner {
     fn default() -> Self {
-        let ext_physical_transform_rules: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> =
-            vec![Arc::new(TableWriterPlanner {}), Arc::new(TagScanPlanner {})];
+        let ext_physical_transform_rules: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> = vec![
+            Arc::new(TableWriterPlanner {}),
+            Arc::new(TagScanPlanner {}),
+            Arc::new(ExpandPlanner::new()),
+        ];
 
         // We need to take care of the rule ordering. They may influence each other.
         let ext_physical_optimizer_rules: Vec<Arc<dyn PhysicalOptimizerRule + Sync + Send>> = vec![
@@ -116,7 +120,7 @@ impl PhysicalPlanner for DefaultPhysicalPlanner {
     async fn create_physical_plan(
         &self,
         logical_plan: &LogicalPlan,
-        session: &IsiphoSessionCtx,
+        session: &SessionCtx,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // 将扩展的物理计划优化规则注入df 的 session state
         let new_state = session
@@ -145,7 +149,7 @@ impl PhysicalOptimizer for DefaultPhysicalPlanner {
     fn optimize(
         &self,
         plan: Arc<dyn ExecutionPlan>,
-        _session: &IsiphoSessionCtx,
+        _session: &SessionCtx,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // df plan阶段已经优化过，直接返回
         Ok(plan)
