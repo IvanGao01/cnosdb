@@ -15,3 +15,6 @@ image = "cnosdb/cross:armv7-unknown-linux-gnueabihf"
 
 [target.armv7-unknown-linux-musleabihf]
 image = "cnosdb/cross:armv7-unknown-linux-musleabihf"
+
+
+# https://gist.github.com/Emilgardis/83fae58858edc3d773f278241b0327b7

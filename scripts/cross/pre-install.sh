@@ -37,6 +37,7 @@ install_protoc() {
   curl -fsSL "${url}" -o "${download_path}"
 
   unzip -qq "${download_path}" -d "${TMP_DIR}"
+  chmod 755 "${TMP_DIR}/bin/protoc"
   mv -fv "${TMP_DIR}/bin/protoc" "${install_path}"
 }
 
