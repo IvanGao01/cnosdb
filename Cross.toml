@@ -24,6 +24,8 @@ image = "cnosdb/cross:armv7-unknown-linux-gnueabihf"
 [target.powerpc64le-unknown-linux-gnu]
 image = "cnosdb/cross:powerpc64le-unknown-linux-gnu"
 
+# Encountered unexpected events:
+# https://gist.github.com/IvanGao01/6c060a579f3f8ab62f6e38ed82ce8bc0
 [target.powerpc-unknown-linux-gnu]
 image = "cnosdb/cross:powerpc-unknown-linux-gnu"
 
