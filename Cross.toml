@@ -4,14 +4,24 @@ image = "cnosdb/cross:x86_64-unknown-linux-gnu"
 [target.aarch64-unknown-linux-gnu]
 image = "cnosdb/cross:aarch64-unknown-linux-gnu"
 
+# Encountered unexpected events:
+# https://gist.github.com/IvanGao01/d679a70223fb632719124d6bf7194c2c
+[target.armv7-unknown-linux-gnueabihf]
+image = "cnosdb/cross:armv7-unknown-linux-gnueabihf"
+
+# Encountered unexpected events:
+# https://gist.github.com/IvanGao01/6c060a579f3f8ab62f6e38ed82ce8bc0
+[target.powerpc64le-unknown-linux-gnu]
+image = "cnosdb/cross:powerpc64le-unknown-linux-gnu"
+
+[target.powerpc-unknown-linux-gnu]
+image = "cnosdb/cross:powerpc-unknown-linux-gnu"
+
 [target.x86_64-unknown-linux-musl]
 image = "cnosdb/cross:x86_64-unknown-linux-musl"
 
 [target.aarch64-unknown-linux-musl]
 image = "cnosdb/cross:aarch64-unknown-linux-musl"
-
-[target.armv7-unknown-linux-gnueabihf]
-image = "cnosdb/cross:armv7-unknown-linux-gnueabihf"
 
 [target.armv7-unknown-linux-musleabihf]
 image = "cnosdb/cross:armv7-unknown-linux-musleabihf"
