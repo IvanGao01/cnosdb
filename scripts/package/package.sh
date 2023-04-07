@@ -61,9 +61,7 @@ build_fpm_cmd() {
 NAME=$1
 ARCH=$2
 OUTPUT_TYPE=$3
-SOURCEFILE_CNOSDB="https://ec6ze24v.oss-cn-beijing.aliyuncs.com/source/$4/release/${VERSION}/cnosdb"
-SOURCEFILE_CNOSDB_CLI="https://ec6ze24v.oss-cn-beijing.aliyuncs.com/source/$4/release/${VERSION}/cnosdb-cli"
-SOURCEFILE_CNOSDB_META="https://ec6ze24v.oss-cn-beijing.aliyuncs.com/source/$4/release/${VERSION}/cnosdb-meta"
+TARGET=$4
 
 PKG_TEMP=$(mktemp -d)
 
@@ -84,8 +82,9 @@ PKG_TEMP=$(mktemp -d)
 
       cp /cnosdb/config/config.toml "${PKG_TEMP}/etc/${NAME}/${NAME}.conf"
 
-      wget -O "${PKG_TEMP}/usr/bin/cnosdb" "${SOURCEFILE_CNOSDB}"
-      wget -O "${PKG_TEMP}/usr/bin/cnosdb-cli" "${SOURCEFILE_CNOSDB_CLI}"
+      # Copy binaries.
+      cp "/cnosdb/target/${TARGET}/release/cnosdb" "${PKG_TEMP}/usr/bin/cnosdb"
+      cp "/cnosdb/target/${TARGET}/release/cnosdb-cli" "${PKG_TEMP}/usr/bin/cnosdb-cli"
 
       chmod 755 "${PKG_TEMP}/usr/bin/cnosdb"
       chmod 755 "${PKG_TEMP}/usr/bin/cnosdb-cli"
@@ -93,7 +92,8 @@ PKG_TEMP=$(mktemp -d)
   elif [ "${NAME}" == "cnosdb-meta" ]; then
 
       cp /cnosdb/meta/config/config.toml "${PKG_TEMP}/etc/cnosdb/${NAME}.conf"
-      wget -O "${PKG_TEMP}/usr/bin/cnosdb-meta" "${SOURCEFILE_CNOSDB_META}"
+
+      cp "/cnosdb/target/${TARGET}/release/cnosdb-meta" "${PKG_TEMP}/usr/bin/cnosdb-meta"
 
       chmod 755 "${PKG_TEMP}/usr/bin/cnosdb-meta"
 
@@ -153,7 +153,7 @@ main(){
         arch=arm64
       fi
       # Call the build_fpm_cmd function with the given arguments
-     build_fpm_cmd "${NAME}" "${arch}" "${output_type}" "$target"
+     build_fpm_cmd "${NAME}" "${arch}" "${output_type}" "${target}"
 
     done
   done
