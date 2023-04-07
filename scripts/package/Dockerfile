@@ -12,4 +12,4 @@ WORKDIR /cnosdb
 
 RUN chmod +x scripts/package/package.sh
 RUN scripts/package/package.sh -n cnosdb-meta
-RUN scripts/package/package.sh -n cnosdb
+RUN #scripts/package/package.sh -n cnosdb

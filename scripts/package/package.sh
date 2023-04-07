@@ -68,22 +68,17 @@ SOURCEFILE_CNOSDB_META="https://ec6ze24v.oss-cn-beijing.aliyuncs.com/source/$4/r
 PKG_TEMP=$(mktemp -d)
 
    # Create layout for packaging under $PKG_TEMP.
-  rm -rf "${PKG_TEMP}"
   mkdir -p "${PKG_TEMP}/usr/bin" \
            "${PKG_TEMP}/var/log/cnosdb" \
            "${PKG_TEMP}/var/lib/cnosdb" \
            "${PKG_TEMP}/etc/cnosdb" \
            "${PKG_TEMP}/usr/lib/${NAME}/scripts"
 
-  chmod -R 0755 "${PKG_TEMP}"
-
   # Copy service scripts.
   cp "/cnosdb/scripts/package/${NAME}/init.sh" "${PKG_TEMP}/usr/lib/${NAME}/scripts/init.sh"
   chmod 0644 "${PKG_TEMP}/usr/lib/${NAME}/scripts/init.sh"
   cp "/cnosdb/scripts/package/${NAME}/${NAME}.service" "${PKG_TEMP}/usr/lib/${NAME}/scripts/${NAME}.service"
   chmod 0644 "${PKG_TEMP}/usr/lib/${NAME}/scripts/${NAME}.service"
-  cp "/cnosdb/scripts/package/${NAME}/${NAME}-systemd-start.sh" "${PKG_TEMP}/usr/lib/${NAME}/scripts/${NAME}-systemd-start.sh"
-  chmod 0755 "${PKG_TEMP}/usr/lib/${NAME}/scripts/${NAME}-systemd-start.sh"
 
   if [ "${NAME}" == "cnosdb" ]; then
 
@@ -92,15 +87,15 @@ PKG_TEMP=$(mktemp -d)
       wget -O "${PKG_TEMP}/usr/bin/cnosdb" "${SOURCEFILE_CNOSDB}"
       wget -O "${PKG_TEMP}/usr/bin/cnosdb-cli" "${SOURCEFILE_CNOSDB_CLI}"
 
-      chmod 755 "${SOURCEFILE_CNOSDB}"
-      chmod 755 "${SOURCEFILE_CNOSDB_CLI}"
+      chmod 755 "${PKG_TEMP}/usr/bin/cnosdb"
+      chmod 755 "${PKG_TEMP}/usr/bin/cnosdb-cli"
 
   elif [ "${NAME}" == "cnosdb-meta" ]; then
 
       cp /cnosdb/meta/config/config.toml "${PKG_TEMP}/etc/cnosdb/${NAME}.conf"
       wget -O "${PKG_TEMP}/usr/bin/cnosdb-meta" "${SOURCEFILE_CNOSDB_META}"
 
-      chmod 755 "${SOURCEFILE_CNOSDB_META}"
+      chmod 755 "${PKG_TEMP}/usr/bin/cnosdb-meta"
 
   else
       echo "Invalid build name."
@@ -117,9 +112,9 @@ PKG_TEMP=$(mktemp -d)
    --architecture "${ARCH}" \
    -s dir \
    --url "https://www.cnosdb.com/" \
-   --before-install /cnosdb/scripts/package/${NAME}/before-install.sh \
-   --after-install /cnosdb/scripts/package/${NAME}/after-install.sh \
-   --after-remove /cnosdb/scripts/package/${NAME}/after-remove.sh \
+   --before-install /cnosdb/scripts/package/"${NAME}"/before-install.sh \
+   --after-install /cnosdb/scripts/package/"${NAME}"/after-install.sh \
+   --after-remove /cnosdb/scripts/package/"${NAME}"/after-remove.sh \
    --directories "${LOG_DIR}" \
    --directories "${DATA_DIR}" \
    --rpm-attr 755,${USER},${GROUP}:${LOG_DIR} \
