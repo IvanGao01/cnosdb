@@ -1,17 +1,25 @@
 [package]
 name = "protos"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 
-[features]
-test = []
 
 [dependencies]
+utils = { path = "../utils" }
+
 chrono = { workspace = true }
 flatbuffers = { workspace = true }
 prost = { workspace = true }
 rand = { workspace = true }
+snafu = { workspace = true }
 tonic = { workspace = true }
+protobuf = { workspace = true }
+async-backtrace = { workspace = true, optional = true }
+
+[features]
+default = []
+test = []
+backtrace = ["async-backtrace"]
 
 [build-dependencies]
 prost-build = { workspace = true }

@@ -1,17 +1,21 @@
 //! Command within CLI
 
-use crate::ctx::{ResultSet, SessionContext};
-use crate::functions::{display_all_functions, Function};
-use crate::print_format::PrintFormat;
-use crate::print_options::PrintOptions;
-use clap::ArgEnum;
-use datafusion::arrow::array::{ArrayRef, StringArray};
-use datafusion::arrow::datatypes::{DataType, Field, Schema};
-use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::error::{DataFusionError, Result};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
+
+use anyhow::anyhow;
+use clap::ValueEnum;
+use datafusion::arrow::array::{ArrayRef, StringArray};
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::record_batch::RecordBatch;
+
+use crate::ctx::{ResultSet, SessionContext};
+use crate::exec::connect_database;
+use crate::functions::{display_all_functions, Function};
+use crate::print_format::PrintFormat;
+use crate::print_options::PrintOptions;
+use crate::Result;
 
 /// Command
 #[derive(Debug)]
@@ -26,7 +30,7 @@ pub enum Command {
     SearchFunctions(String),
     QuietMode(Option<bool>),
     OutputFormat(Option<String>),
-    Write(String),
+    WriteLineProtocol(String),
 }
 
 pub enum OutputFormat {
@@ -38,22 +42,14 @@ impl Command {
         &self,
         ctx: &mut SessionContext,
         print_options: &mut PrintOptions,
-    ) -> std::result::Result<(), String> {
+    ) -> Result<()> {
         let now = Instant::now();
         match self {
-            Self::Help => print_options.print_batches(&all_commands_info(), now),
-            Self::ConnectDatabase(database) => {
-                let old_database = ctx.get_database().to_string();
-                ctx.set_database(database);
-                match ctx.sql(format!("DESCRIBE DATABASE {}", database)).await {
-                    Ok(_) => Ok(()),
-                    Err(e) => {
-                        println!("Cannot connect to database {}.", database);
-                        ctx.set_database(old_database.as_str());
-                        Err(e)
-                    }
-                }
-            }
+            Self::Help => print_options.print_batches(&(all_commands_info()?), now),
+            Self::ConnectDatabase(database) => connect_database(database, ctx).await.map_err(|e| {
+                println!("Cannot connect to database {}.", database);
+                e
+            }),
             Self::ListTables => {
                 let results = ctx.sql("SHOW TABLES".to_string()).await?;
                 print_options.print_batches(&results, now)
@@ -81,7 +77,7 @@ impl Command {
                 }
                 Ok(())
             }
-            Self::Quit => Err("Unexpected quit, this should be handled outside".to_string()),
+            Self::Quit => Err(anyhow!("Unexpected quit, this should be handled outside")),
             Self::ListFunctions => display_all_functions(),
             Self::SearchFunctions(function) => {
                 if let Ok(func) = function.parse::<Function>() {
@@ -89,16 +85,16 @@ impl Command {
                     println!("{}", details);
                     Ok(())
                 } else {
-                    let msg = format!("{} is not a supported function", function);
-                    Err(msg)
+                    Err(anyhow!("{function} is not a supported function"))
                 }
             }
-            Self::OutputFormat(_) => {
-                Err("Unexpected change output format, this should be handled outside".to_string())
-            }
-            Self::Write(path) => {
-                let results = ctx.write(path).await?;
-                print_options.print_batches(&results, now)
+            Self::OutputFormat(_) => Err(anyhow!(
+                "Unexpected change output format, this should be handled outside"
+            )),
+            Self::WriteLineProtocol(path) => {
+                ctx.write(path).await?;
+                let result_set = ResultSet::Bytes((vec![], 0));
+                print_options.print_batches(&result_set, now)
             }
         }
     }
@@ -115,7 +111,7 @@ impl Command {
             Self::SearchFunctions(_) => ("\\h function", "search function"),
             Self::QuietMode(_) => ("\\quiet (true|false)?", "print or set quiet mode"),
             Self::OutputFormat(_) => ("\\pset [NAME [VALUE]]", "set table output option\n(format)"),
-            Self::Write(_) => ("\\w path", "line protocol"),
+            Self::WriteLineProtocol(_) => ("\\w path", "line protocol"),
         }
     }
 }
@@ -131,10 +127,10 @@ const ALL_COMMANDS: [Command; 11] = [
     Command::SearchFunctions(String::new()),
     Command::QuietMode(None),
     Command::OutputFormat(None),
-    Command::Write(String::new()),
+    Command::WriteLineProtocol(String::new()),
 ];
 
-fn all_commands_info() -> ResultSet {
+fn all_commands_info() -> Result<ResultSet> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("Command", DataType::Utf8, false),
         Field::new("Description", DataType::Utf8, false),
@@ -149,10 +145,9 @@ fn all_commands_info() -> ResultSet {
             .into_iter()
             .map(|i| Arc::new(StringArray::from(i)) as ArrayRef)
             .collect::<Vec<_>>(),
-    )
-    .expect("This should not fail");
+    )?;
 
-    ResultSet::RecordBatches(vec![r])
+    Ok(ResultSet::RecordBatches(vec![r]))
 }
 
 impl FromStr for Command {
@@ -177,7 +172,8 @@ impl FromStr for Command {
             ("quiet", None) => Self::QuietMode(None),
             ("pset", Some(subcommand)) => Self::OutputFormat(Some(subcommand.to_string())),
             ("pset", None) => Self::OutputFormat(None),
-            ("w", Some(path)) => Self::Write(path.into()),
+            ("w", Some(path)) => Self::WriteLineProtocol(path.into()),
+            ("db", Some(db)) => Self::DescribeDatabase(db.to_string()),
             _ => return Err(()),
         })
     }
@@ -208,11 +204,11 @@ impl OutputFormat {
                     println!("Output format is {:?}.", print_options.format);
                     Ok(())
                 } else {
-                    Err(DataFusionError::Execution(format!(
+                    Err(anyhow!(
                         "{:?} is not a valid format type [possible values: {:?}]",
                         format,
                         PrintFormat::value_variants()
-                    )))
+                    ))
                 }
             }
         }

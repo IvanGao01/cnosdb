@@ -13,3 +13,10 @@ pub const STAR_STAR: &str = "*/*";
 
 /// basic auth
 pub const BASIC_PREFIX: &str = "Basic ";
+pub const BEARER_PREFIX: &str = "Bearer ";
+
+// parameters
+pub const TENANT: &str = "tenant";
+pub const DB: &str = "db";
+pub const TARGET_PARTITIONS: &str = "target_partitions";
+pub const STREAM_TRIGGER_INTERVAL: &str = "stream_trigger_interval";

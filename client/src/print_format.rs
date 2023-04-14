@@ -1,4 +1,6 @@
 //! Print format variants
+use std::str::FromStr;
+
 use datafusion::arrow::csv::writer::WriterBuilder;
 use datafusion::arrow::json::{ArrayWriter, LineDelimitedWriter};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -7,10 +9,9 @@ use datafusion::error::{DataFusionError, Result};
 use http_protocol::header::{
     APPLICATION_CSV, APPLICATION_JSON, APPLICATION_NDJSON, APPLICATION_TABLE, APPLICATION_TSV,
 };
-use std::str::FromStr;
 
 /// Allow records to be printed in different formats
-#[derive(Debug, PartialEq, Eq, clap::ArgEnum, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, clap::ValueEnum, Clone, Copy)]
 pub enum PrintFormat {
     Csv,
     Tsv,
@@ -23,7 +24,7 @@ impl FromStr for PrintFormat {
     type Err = String;
 
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        clap::ArgEnum::from_str(s, true)
+        clap::ValueEnum::from_str(s, true)
     }
 }
 
@@ -83,11 +84,13 @@ impl PrintFormat {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::Arc;
+
     use datafusion::arrow::array::Int32Array;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::from_slice::FromSlice;
-    use std::sync::Arc;
+
+    use super::*;
 
     #[test]
     fn test_print_batches_with_sep() {

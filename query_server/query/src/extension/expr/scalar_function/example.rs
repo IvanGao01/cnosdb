@@ -1,13 +1,12 @@
 use std::sync::Arc;
 
-use datafusion::{
-    arrow::{array::ArrayRef, datatypes::DataType},
-    logical_expr::{ScalarUDF, Volatility},
-    physical_expr::functions::make_scalar_function,
-    prelude::create_udf,
-};
-
-use spi::query::function::{FunctionMetadataManager, Result};
+use datafusion::arrow::array::ArrayRef;
+use datafusion::arrow::datatypes::DataType;
+use datafusion::logical_expr::{ScalarUDF, Volatility};
+use datafusion::physical_expr::functions::make_scalar_function;
+use datafusion::prelude::create_udf;
+use spi::query::function::FunctionMetadataManager;
+use spi::Result;
 
 pub fn register_udf(func_manager: &mut dyn FunctionMetadataManager) -> Result<ScalarUDF> {
     let udf = new();

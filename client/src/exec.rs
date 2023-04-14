@@ -1,17 +1,18 @@
 //! Execution functions
 
-use crate::{
-    command::{Command, OutputFormat},
-    ctx::SessionContext,
-    helper::CliHelper,
-    print_options::PrintOptions,
-};
-use rustyline::error::ReadlineError;
-use rustyline::Editor;
 use std::fs::File;
 use std::io::prelude::*;
 use std::io::BufReader;
 use std::time::Instant;
+
+use rustyline::error::ReadlineError;
+use rustyline::Editor;
+
+use crate::command::{Command, OutputFormat};
+use crate::ctx::SessionContext;
+use crate::helper::CliHelper;
+use crate::print_options::PrintOptions;
+use crate::Result;
 
 /// run and execute SQL statements and commands from a file, against a context with the given print options
 pub async fn exec_from_lines(
@@ -100,7 +101,7 @@ pub async fn exec_from_repl(ctx: &mut SessionContext, print_options: &mut PrintO
                         }
                         _ => {
                             if let Err(e) = cmd.execute(ctx, &mut print_options).await {
-                                eprintln!("{}", e)
+                                eprintln!("{e}")
                             }
                         }
                     }
@@ -108,6 +109,15 @@ pub async fn exec_from_repl(ctx: &mut SessionContext, print_options: &mut PrintO
                     eprintln!("'\\{}' is not a valid command", &line[1..]);
                 }
             }
+
+            Ok(line) if use_database(&line).is_some() => {
+                if let Some(db) = use_database(&line) {
+                    if connect_database(&db, ctx).await.is_err() {
+                        println!("Cannot connect to database {}.", db);
+                    }
+                }
+            }
+
             Ok(line) => {
                 rl.add_history_entry(line.trim_end());
                 match exec_and_print(ctx, &print_options, line).await {
@@ -137,10 +147,53 @@ async fn exec_and_print(
     ctx: &mut SessionContext,
     print_options: &PrintOptions,
     sql: String,
-) -> Result<(), String> {
-    let now = Instant::now();
-    let results = ctx.sql(sql).await?;
-    print_options.print_batches(&results, now)?;
+) -> Result<()> {
+    let strs: Vec<&str> = sql.split(';').collect();
+    for tmp in strs.iter() {
+        if tmp.trim().is_empty() {
+            continue;
+        }
+
+        let now = Instant::now();
+        let results = ctx.sql(tmp.to_string() + ";").await?;
+        print_options.print_batches(&results, now)?;
+    }
 
     Ok(())
+}
+
+fn use_database(sql: &str) -> Option<String> {
+    let sql = sql.trim().trim_end_matches(';');
+    if !sql[0..3].to_ascii_lowercase().eq("use") {
+        return None;
+    }
+
+    let sql = sql[3..].trim();
+
+    if sql.starts_with('"') && sql.ends_with('"') {
+        Some(sql[1..sql.len() - 1].to_string())
+    } else {
+        Some(sql.to_string())
+    }
+}
+
+pub fn is_system_table_db(db: &str) -> bool {
+    let db = db.to_ascii_lowercase();
+    db.eq("cluster_schema") || db.eq("information_schema")
+}
+
+pub async fn connect_database(database: &str, ctx: &mut SessionContext) -> Result<()> {
+    if is_system_table_db(database) {
+        ctx.set_database(database);
+        return Ok(());
+    }
+    let old_database = ctx.get_database().to_string();
+    ctx.set_database(database);
+    ctx.sql(format!("DESCRIBE DATABASE {}", database))
+        .await
+        .map_err(|e| {
+            ctx.set_database(old_database.as_str());
+            e
+        })
+        .map(|_| ())
 }

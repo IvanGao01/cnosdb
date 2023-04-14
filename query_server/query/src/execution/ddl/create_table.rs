@@ -1,12 +1,14 @@
-use crate::execution::ddl::DDLDefinitionTask;
+use std::sync::Arc;
+
 use async_trait::async_trait;
-use datafusion::sql::TableReference;
+use meta::error::MetaError;
 use models::schema::{TableSchema, TskvTableSchema};
 use snafu::ResultExt;
-use spi::catalog::{MetaDataRef, MetadataError};
-use spi::query::execution;
-use spi::query::execution::{ExecutionError, Output, QueryStateMachineRef};
+use spi::query::execution::{Output, QueryStateMachineRef};
 use spi::query::logical_planner::CreateTable;
+use spi::Result;
+
+use crate::execution::ddl::DDLDefinitionTask;
 
 pub struct CreateTableTask {
     stmt: CreateTable,
@@ -20,55 +22,66 @@ impl CreateTableTask {
 
 #[async_trait]
 impl DDLDefinitionTask for CreateTableTask {
-    async fn execute(
-        &self,
-        query_state_machine: QueryStateMachineRef,
-    ) -> Result<Output, ExecutionError> {
+    async fn execute(&self, query_state_machine: QueryStateMachineRef) -> Result<Output> {
         let CreateTable {
             ref name,
             ref if_not_exists,
             ..
         } = self.stmt;
 
-        let table_ref: TableReference = name.as_str().into();
-        let table = query_state_machine.catalog.table(table_ref);
+        let tenant = query_state_machine.session.tenant();
+        let client = query_state_machine
+            .meta
+            .tenant_manager()
+            .tenant_meta(tenant)
+            .await
+            .ok_or(MetaError::TenantNotFound {
+                tenant: tenant.to_string(),
+            })?;
+        let table = client.get_tskv_table_schema(name.database(), name.table())?;
 
         match (if_not_exists, table) {
             // do not create if exists
-            (true, Ok(_)) => Ok(Output::Nil(())),
+            (true, Some(_)) => Ok(Output::Nil(())),
             // Report an error if it exists
-            (false, Ok(_)) => Err(MetadataError::TableAlreadyExists {
-                table_name: name.clone(),
-            })
-            .context(execution::MetadataSnafu),
+            (false, Some(_)) => Err(MetaError::TableAlreadyExists {
+                table_name: name.to_string(),
+            })?,
             // does not exist, create
-            (_, Err(_)) => {
-                create_table(&self.stmt, query_state_machine.catalog.clone())?;
+            (_, None) => {
+                create_table(&self.stmt, query_state_machine).await?;
                 Ok(Output::Nil(()))
             }
         }
     }
 }
 
-fn create_table(stmt: &CreateTable, catalog: MetaDataRef) -> Result<(), ExecutionError> {
+async fn create_table(stmt: &CreateTable, machine: QueryStateMachineRef) -> Result<()> {
     let CreateTable { name, .. } = stmt;
-    let table_schema = build_schema(stmt, catalog.clone());
-    catalog
-        .create_table(name, TableSchema::TsKvTableSchema(table_schema))
-        .context(execution::MetadataSnafu)
+
+    let client = machine
+        .meta
+        .tenant_manager()
+        .tenant_meta(name.tenant())
+        .await
+        .ok_or(MetaError::TenantNotFound {
+            tenant: name.tenant().to_string(),
+        })?;
+
+    let table_schema = build_schema(stmt);
+    client
+        .create_table(&TableSchema::TsKvTableSchema(Arc::new(table_schema)))
+        .await
+        .context(spi::MetaSnafu)
 }
 
-fn build_schema(stmt: &CreateTable, catalog: MetaDataRef) -> TskvTableSchema {
+fn build_schema(stmt: &CreateTable) -> TskvTableSchema {
     let CreateTable { schema, name, .. } = stmt;
 
-    let table: TableReference = name.as_str().into();
-    let catalog_name = catalog.catalog_name();
-    let schema_name = catalog.schema_name();
-    let table_ref = table.resolve(catalog_name, schema_name);
-
     TskvTableSchema::new(
-        table_ref.schema.to_string(),
-        table.table().to_string(),
+        name.tenant().to_string(),
+        name.database().to_string(),
+        name.table().to_string(),
         schema.to_owned(),
     )
 }

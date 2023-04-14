@@ -1,17 +1,17 @@
 # IDE
+/.fleet
 **/.idea/
+/.vs
 /.vscode/
 
 # Cargo
 **/target
-Cargo.lock
 
 # OS
 .DS_Store
 
 # Developing
 **/dev/
-**/data/
 **/tskv_log/
 
 # tmpfile
@@ -21,4 +21,8 @@ test_*.log
 *.history
 
 #generated files
-**/protos/src/generated/
+common/license/private.rsa
+common/license/public.rsa
+
+# Jupyter Notebook
+.ipynb_checkpoints

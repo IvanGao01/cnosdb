@@ -1,20 +1,55 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use models::SeriesId;
+use error_code::{ErrorCode, ErrorCoder};
+use meta::error::MetaError;
+use protos::PointsError;
 use snafu::Snafu;
 
-use crate::{
-    tsm::{ReadTsmError, WriteTsmError},
-    wal,
-};
+use crate::index::IndexError;
+use crate::schema::error::SchemaError;
+use crate::tsm::{ReadTsmError, WriteTsmError};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Snafu, Debug)]
+#[derive(Snafu, Debug, ErrorCoder)]
 #[snafu(visibility(pub))]
+#[error_code(mod_code = "02")]
 pub enum Error {
+    Meta {
+        source: MetaError,
+    },
+
+    #[snafu(display("Invalid flatbuffers: {}", source))]
+    #[error_code(code = 1)]
+    InvalidFlatbuffer {
+        source: flatbuffers::InvalidFlatbuffer,
+    },
+
+    #[snafu(display("Fields can't be empty"))]
+    #[error_code(code = 2)]
+    InvalidPoint,
+
+    #[snafu(display("{}", reason))]
+    #[error_code(code = 3)]
+    CommonError {
+        reason: String,
+    },
+
+    #[snafu(display("DataSchemaError: {}", source))]
+    #[error_code(code = 4)]
+    Schema {
+        source: SchemaError,
+    },
+
+    #[snafu(display("Memory Exhausted Retry Later"))]
+    #[error_code(code = 5)]
+    MemoryExhausted,
+
+    // Internal Error
     #[snafu(display("{}", source))]
-    IO { source: std::io::Error },
+    IO {
+        source: std::io::Error,
+    },
 
     #[snafu(display("Unable to open file '{}': {}", path.display(), source))]
     OpenFile {
@@ -22,20 +57,34 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    #[snafu(display("Error with read file: {}", source))]
-    ReadFile { source: std::io::Error },
+    #[snafu(display("Error with read file '{}': {}", path.display(), source))]
+    ReadFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 
-    #[snafu(display("Unable to write file: {}", source))]
-    WriteFile { source: std::io::Error },
+    #[snafu(display("Unable to write file '{}': {}", path.display(), source))]
+    WriteFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 
     #[snafu(display("Unable to sync file: {}", source))]
-    SyncFile { source: std::io::Error },
+    SyncFile {
+        source: std::io::Error,
+    },
 
     #[snafu(display("File {} has wrong name format: {}", file_name, message))]
-    InvalidFileName { file_name: String, message: String },
+    InvalidFileName {
+        file_name: String,
+        message: String,
+    },
 
-    #[snafu(display("async file system stopped"))]
-    Cancel,
+    #[snafu(display("File '{}' has wrong format: {}", path.display(), message))]
+    InvalidFileFormat {
+        path: PathBuf,
+        message: String,
+    },
 
     #[snafu(display("fails to send to channel"))]
     Send,
@@ -45,73 +94,109 @@ pub enum Error {
         source: tokio::sync::oneshot::error::RecvError,
     },
 
-    #[snafu(display("invalid flatbuffers: {}", source))]
-    InvalidFlatbuffer {
-        source: flatbuffers::InvalidFlatbuffer,
-    },
-
     #[snafu(display("wal truncated"))]
     WalTruncated,
 
+    #[snafu(display("read/write record file block: {}", reason))]
+    RecordFileIo {
+        reason: String,
+    },
+
+    #[snafu(display("Unexpected eof"))]
+    Eof,
+
     #[snafu(display("read record file block: {}", source))]
-    LogRecordErr {
-        source: crate::record_file::RecordFileError,
+    Encode {
+        source: bincode::Error,
     },
 
     #[snafu(display("read record file block: {}", source))]
-    Encode { source: bincode::Error },
-
-    #[snafu(display("read record file block: {}", source))]
-    Decode { source: bincode::Error },
+    Decode {
+        source: bincode::Error,
+    },
 
     #[snafu(display("Index: : {}", source))]
-    IndexErr { source: crate::index::IndexError },
+    IndexErr {
+        source: crate::index::IndexError,
+    },
 
     #[snafu(display("error apply edits to summary"))]
     ErrApplyEdit,
 
     #[snafu(display("read tsm block file error: {}", source))]
-    ReadTsm { source: ReadTsmError },
+    ReadTsm {
+        source: ReadTsmError,
+    },
 
     #[snafu(display("write tsm block file error: {}", source))]
-    WriteTsm { source: WriteTsmError },
-
-    #[snafu(display("compact tsm block file error: {}", reason))]
-    Compact { reason: String },
-
-    #[snafu(display("unable to walk dir: {}", source))]
-    UnableToWalkDir { source: walkdir::Error },
-
-    #[snafu(display("database not found: {}", database))]
-    DatabaseNotFound { database: String },
-
-    #[snafu(display("database '{}' already exists", database))]
-    DatabaseAlreadyExists { database: String },
-
-    #[snafu(display("invalid model: {}", source))]
-    InvalidModel { source: models::Error },
-
-    #[snafu(display("invalid tseries id : {}", tf_id))]
-    InvalidTsfid { tf_id: u32 },
+    WriteTsm {
+        source: WriteTsmError,
+    },
 
     #[snafu(display("character set error"))]
     ErrCharacterSet,
 
-    #[snafu(display("panics in thread: {}", reason))]
-    ThreadJoin { reason: String },
+    #[snafu(display("Invalid parameter : {}", reason))]
+    InvalidParam {
+        reason: String,
+    },
 
-    #[snafu(display("data fusion RecordBatch::try_new {}", reason))]
-    DataFusionNew { reason: String },
+    #[snafu(display("file has no footer"))]
+    NoFooter,
 
-    #[snafu(display("can't find field name: {}", reason))]
-    NotFoundField { reason: String },
+    #[snafu(display("unable to transform: {}", reason))]
+    Transform {
+        reason: String,
+    },
 
-    #[snafu(display("unknown type"))]
-    UnKnowType,
+    #[snafu(display("invalid points : '{}'", source))]
+    Points {
+        source: PointsError,
+    },
+}
 
-    #[snafu(display("tags or fields can't be empty"))]
-    InvalidPoint,
+impl From<PointsError> for Error {
+    fn from(value: PointsError) -> Self {
+        Error::Points { source: value }
+    }
+}
 
-    #[snafu(display("table not found for {}", table_name))]
-    NotFoundTable { table_name: String },
+impl From<SchemaError> for Error {
+    fn from(value: SchemaError) -> Self {
+        match value {
+            SchemaError::Meta { source } => Self::Meta { source },
+            other => Error::Schema { source: other },
+        }
+    }
+}
+
+impl From<IndexError> for Error {
+    fn from(value: IndexError) -> Self {
+        Error::IndexErr { source: value }
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(value: std::io::Error) -> Self {
+        Error::IO { source: value }
+    }
+}
+
+impl Error {
+    pub fn error_code(&self) -> &dyn ErrorCode {
+        match self {
+            Error::Meta { source } => source.error_code(),
+            _ => self,
+        }
+    }
+}
+
+#[test]
+fn test_mod_code() {
+    let e = Error::Schema {
+        source: SchemaError::ColumnAlreadyExists {
+            name: "".to_string(),
+        },
+    };
+    assert!(e.code().starts_with("02"));
 }

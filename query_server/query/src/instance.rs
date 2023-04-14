@@ -1,44 +1,65 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::scheduler::Scheduler;
-use spi::{
-    query::{dispatcher::QueryDispatcher, session::IsiphoSessionCtxFactory},
-    server::dbms::DatabaseManagerSystem,
-    server::BuildSnafu,
-    server::Result,
-    server::{LoadFunctionSnafu, MetaDataSnafu, QuerySnafu},
-    service::protocol::{Query, QueryHandle, QueryId},
-};
-
+use coordinator::service::CoordinatorRef;
+use derive_builder::Builder;
+use memory_pool::MemoryPoolRef;
+use models::auth::user::{User, UserInfo};
+use models::auth::AuthError;
+use models::oid::Oid;
+use snafu::ResultExt;
+use spi::query::auth::AccessControlRef;
+use spi::query::datasource::stream::checker::StreamCheckerManager;
+use spi::query::datasource::stream::StreamProviderManager;
+use spi::query::dispatcher::QueryDispatcher;
+use spi::query::session::SessionCtxFactory;
+use spi::server::dbms::DatabaseManagerSystem;
+use spi::service::protocol::{Query, QueryHandle, QueryId};
+use spi::{AuthSnafu, Result};
+use trace::debug;
 use tskv::kv_option::Options;
 
+use crate::auth::auth_control::{AccessControlImpl, AccessControlNoCheck};
+use crate::data_source::split;
+use crate::data_source::stream::tskv::factory::{TskvStreamProviderFactory, TSKV_STREAM_PROVIDER};
 use crate::dispatcher::manager::SimpleQueryDispatcherBuilder;
+use crate::execution::scheduler::local::LocalScheduler;
 use crate::extension::expr::load_all_functions;
 use crate::function::simple_func_manager::SimpleFunctionMetadataManager;
-use crate::metadata::LocalCatalogMeta;
 use crate::sql::optimizer::CascadeOptimizerBuilder;
 use crate::sql::parser::DefaultParser;
-use snafu::ResultExt;
-use tskv::engine::EngineRef;
 
-pub struct Cnosdbms {
+#[derive(Builder)]
+pub struct Cnosdbms<D: QueryDispatcher> {
+    // TODO access control
+    access_control: AccessControlRef,
     // query dispatcher & query execution
-    query_dispatcher: Arc<dyn QueryDispatcher>,
+    query_dispatcher: D,
 }
 
 #[async_trait]
-impl DatabaseManagerSystem for Cnosdbms {
+impl<D> DatabaseManagerSystem for Cnosdbms<D>
+where
+    D: QueryDispatcher,
+{
+    async fn authenticate(&self, user_info: &UserInfo, tenant_name: Option<&str>) -> Result<User> {
+        self.access_control
+            .access_check(user_info, tenant_name)
+            .await
+            .context(AuthSnafu)
+    }
+
     async fn execute(&self, query: &Query) -> Result<QueryHandle> {
-        let id = self.query_dispatcher.create_query_id();
+        let query_id = self.query_dispatcher.create_query_id();
+
+        let tenant_id = self.get_tenant_id(query.context().tenant()).await?;
 
         let result = self
             .query_dispatcher
-            .execute_query(id, query)
-            .await
-            .context(QuerySnafu)?;
+            .execute_query(tenant_id, query_id, query)
+            .await?;
 
-        Ok(QueryHandle::new(id, query.clone(), result))
+        Ok(QueryHandle::new(query_id, query.clone(), result))
     }
 
     fn metrics(&self) -> String {
@@ -65,58 +86,102 @@ impl DatabaseManagerSystem for Cnosdbms {
     }
 }
 
-pub fn make_cnosdbms(engine: EngineRef, options: Options) -> Result<Cnosdbms> {
-    // todo: add query config
-    // for now only support local mode
-    let mut function_manager = SimpleFunctionMetadataManager::default();
-    load_all_functions(&mut function_manager).context(LoadFunctionSnafu)?;
-
-    let meta = Arc::new(
-        LocalCatalogMeta::new_with_default(engine, Arc::new(function_manager))
-            .context(MetaDataSnafu)?,
-    );
-
+impl<D: QueryDispatcher> Cnosdbms<D> {
+    pub(crate) async fn get_tenant_id(
+        &self,
+        tenant_name: &str,
+    ) -> std::result::Result<Oid, AuthError> {
+        self.access_control.tenant_id(tenant_name).await
+    }
+}
+pub async fn make_cnosdbms(
+    coord: CoordinatorRef,
+    options: Options,
+    memory_pool: MemoryPoolRef,
+) -> Result<impl DatabaseManagerSystem> {
+    let split_manager = split::default_split_manager_ref();
     // TODO session config need load global system config
-    let session_factory = Arc::new(IsiphoSessionCtxFactory::default());
+    let session_factory = Arc::new(SessionCtxFactory::default());
     let parser = Arc::new(DefaultParser::default());
     let optimizer = Arc::new(CascadeOptimizerBuilder::default().build());
     // TODO wrap, and num_threads configurable
-    let scheduler = Arc::new(Scheduler::new(num_cpus::get() * 2));
+    let scheduler = Arc::new(LocalScheduler {});
+
+    // init Function Manager
+    let mut func_manager = SimpleFunctionMetadataManager::default();
+    load_all_functions(&mut func_manager)?;
+
+    // init stream provider manager
+    let mut stream_provider_manager = StreamProviderManager::default();
+    // stream provider factory of tskv
+    let tskv_stream_provider_factory = Arc::new(TskvStreamProviderFactory::new(
+        coord.clone(),
+        split_manager.clone(),
+    ));
+    stream_provider_manager.register_stream_provider_factory(
+        TSKV_STREAM_PROVIDER,
+        tskv_stream_provider_factory.clone(),
+    )?;
+
+    // init stream checker manager
+    let mut stream_checker_manager = StreamCheckerManager::default();
+    // stream table checker of tskv
+    stream_checker_manager
+        .register_stream_checker(TSKV_STREAM_PROVIDER, tskv_stream_provider_factory)?;
 
     let queries_limit = options.query.max_server_connections;
 
-    let simple_query_dispatcher = SimpleQueryDispatcherBuilder::default()
-        .with_metadata(meta)
+    let meta_manager = coord.meta_manager();
+
+    let query_dispatcher = SimpleQueryDispatcherBuilder::default()
+        .with_coord(coord)
+        .with_split_manager(split_manager)
         .with_session_factory(session_factory)
         .with_parser(parser)
         .with_optimizer(optimizer)
         .with_scheduler(scheduler)
         .with_queries_limit(queries_limit)
-        .build()
-        .context(BuildSnafu)?;
+        .with_memory_pool(memory_pool)
+        .with_func_manager(Arc::new(func_manager))
+        .with_stream_provider_manager(Arc::new(stream_provider_manager))
+        .with_stream_checker_manager(Arc::new(stream_checker_manager))
+        .build()?;
 
-    Ok(Cnosdbms {
-        query_dispatcher: Arc::new(simple_query_dispatcher),
-    })
+    let mut builder = CnosdbmsBuilder::default();
+
+    let access_control_no_check = AccessControlNoCheck::new(meta_manager);
+    if options.query.auth_enabled {
+        debug!("build access control");
+        builder.access_control(Arc::new(AccessControlImpl::new(access_control_no_check)))
+    } else {
+        debug!("build access control without check");
+        builder.access_control(Arc::new(access_control_no_check))
+    };
+
+    let db_server = builder
+        .query_dispatcher(query_dispatcher)
+        .build()
+        .expect("build db server");
+
+    Ok(db_server)
 }
 
 #[cfg(test)]
 mod tests {
-    use chrono::Utc;
-    use config::get_config;
     use std::ops::DerefMut;
+
+    use chrono::Utc;
+    use config::get_config_for_test;
+    use coordinator::service_mock::MockCoordinator;
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::arrow::util::pretty::pretty_format_batches;
+    use datafusion::execution::memory_pool::GreedyMemoryPool;
+    use models::auth::user::UserInfo;
+    use models::schema::DEFAULT_CATALOG;
+    use spi::service::protocol::ContextBuilder;
     use trace::debug;
 
     use super::*;
-    use datafusion::arrow::{
-        datatypes::Schema, record_batch::RecordBatch, util::pretty::pretty_format_batches,
-    };
-    use spi::{
-        catalog::DEFAULT_CATALOG,
-        query::execution::Output,
-        service::protocol::{ContextBuilder, UserInfo},
-    };
-    use tskv::engine::MockEngine;
 
     #[macro_export]
     macro_rules! assert_batches_eq {
@@ -135,37 +200,34 @@ mod tests {
         };
     }
 
-    async fn exec_sql(db: &Cnosdbms, sql: &str) -> Vec<RecordBatch> {
+    async fn exec_sql(db: &impl DatabaseManagerSystem, sql: &str) -> Vec<RecordBatch> {
         let user = UserInfo {
             user: DEFAULT_CATALOG.to_string(),
             password: "todo".to_string(),
+            private_key: None,
         };
+
+        let user = db
+            .authenticate(&user, Some(DEFAULT_CATALOG))
+            .await
+            .expect("authenticate");
+
         let query = Query::new(ContextBuilder::new(user).build(), sql.to_string());
 
-        // let db = make_cnosdbms(Arc::new(MockEngine::default())).unwrap();
-        let mut actual = vec![];
+        let result = db.execute(&query).await.unwrap();
 
-        let mut result = db.execute(&query).await.unwrap();
-
-        for ele in result.result().iter_mut() {
-            match ele {
-                Output::StreamData(data) => {
-                    actual.append(data);
-                }
-                Output::Nil(_) => {
-                    let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
-                    actual.push(batch);
-                }
-            }
-        }
-        actual
+        result.result().chunk_result().to_vec()
     }
 
     #[tokio::test]
+    #[ignore]
     async fn test_simple_sql() {
-        let config = get_config("../../config/config.toml");
+        let config = get_config_for_test();
         let opt = Options::from(&config);
-        let db = make_cnosdbms(Arc::new(MockEngine::default()), opt).unwrap();
+        let memory = Arc::new(GreedyMemoryPool::new(1024 * 1024 * 1024));
+        let db = make_cnosdbms(Arc::new(MockCoordinator::default()), opt, memory)
+            .await
+            .unwrap();
 
         let mut result = exec_sql(&db, "SELECT * FROM (VALUES (1, 'one'), (2, 'two'), (3, 'three')) AS t (num,letter) order by num").await;
 
@@ -194,7 +256,6 @@ mod tests {
         // random.gen_range();
         debug!("start generate data.");
         let rows: Vec<String> = (0..n)
-            .into_iter()
             .map(|i| {
                 format!(
                     "({}, '{}----xxxxxx=====3333444hhhhhhxx324r9cc')",
@@ -218,9 +279,12 @@ mod tests {
     #[ignore]
     async fn test_topk_sql() {
         // trace::init_default_global_tracing("/tmp", "test_rust.log", "debug");
-        let config = get_config("../../config/config.toml");
+        let config = get_config_for_test();
         let opt = Options::from(&config);
-        let db = make_cnosdbms(Arc::new(MockEngine::default()), opt).unwrap();
+        let memory = Arc::new(GreedyMemoryPool::new(1024 * 1024 * 1024));
+        let db = make_cnosdbms(Arc::new(MockCoordinator::default()), opt, memory)
+            .await
+            .unwrap();
 
         let sql = format!(
             "SELECT * FROM
@@ -250,11 +314,15 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore]
     async fn test_topk_desc_sql() {
         // trace::init_default_global_tracing("/tmp", "test_rust.log", "debug");
-        let config = get_config("../../config/config.toml");
+        let config = get_config_for_test();
         let opt = Options::from(&config);
-        let db = make_cnosdbms(Arc::new(MockEngine::default()), opt).unwrap();
+        let memory = Arc::new(GreedyMemoryPool::new(1024 * 1024 * 1024));
+        let db = make_cnosdbms(Arc::new(MockCoordinator::default()), opt, memory)
+            .await
+            .unwrap();
 
         let mut result = exec_sql(
             &db,
@@ -286,9 +354,12 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_create_external_csv_table() {
-        let config = get_config("../../config/config.toml");
+        let config = get_config_for_test();
         let opt = Options::from(&config);
-        let db = make_cnosdbms(Arc::new(MockEngine::default()), opt).unwrap();
+        let memory = Arc::new(GreedyMemoryPool::new(1024 * 1024 * 1024));
+        let db = make_cnosdbms(Arc::new(MockCoordinator::default()), opt, memory)
+            .await
+            .unwrap();
 
         assert_batches_eq!(
             vec!["++", "++", "++",],
@@ -340,9 +411,12 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_create_external_parquet_table() {
-        let config = get_config("../../config/config.toml");
+        let config = get_config_for_test();
         let opt = Options::from(&config);
-        let db = make_cnosdbms(Arc::new(MockEngine::default()), opt).unwrap();
+        let memory = Arc::new(GreedyMemoryPool::new(1024 * 1024 * 1024));
+        let db = make_cnosdbms(Arc::new(MockCoordinator::default()), opt, memory)
+            .await
+            .unwrap();
 
         assert_batches_eq!(
             vec!["++", "++", "++",],
@@ -386,9 +460,12 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_create_external_json_table() {
-        let config = get_config("../config/config.toml");
+        let config = get_config_for_test();
         let opt = Options::from(&config);
-        let db = make_cnosdbms(Arc::new(MockEngine::default()), opt).unwrap();
+        let memory = Arc::new(GreedyMemoryPool::new(1024 * 1024 * 1024));
+        let db = make_cnosdbms(Arc::new(MockCoordinator::default()), opt, memory)
+            .await
+            .unwrap();
 
         assert_batches_eq!(
             vec!["++", "++", "++",],

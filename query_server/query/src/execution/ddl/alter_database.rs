@@ -1,10 +1,11 @@
-use crate::execution::ddl::DDLDefinitionTask;
 use async_trait::async_trait;
+use meta::error::MetaError;
 use models::schema::DatabaseOptions;
-use snafu::ResultExt;
-use spi::query::execution;
-use spi::query::execution::{ExecutionError, Output, QueryStateMachineRef};
+use spi::query::execution::{Output, QueryStateMachineRef};
 use spi::query::logical_planner::AlterDatabase;
+use spi::Result;
+
+use crate::execution::ddl::DDLDefinitionTask;
 
 pub struct AlterDatabaseTask {
     stmt: AlterDatabase,
@@ -18,19 +19,31 @@ impl AlterDatabaseTask {
 
 #[async_trait]
 impl DDLDefinitionTask for AlterDatabaseTask {
-    async fn execute(
-        &self,
-        query_state_machine: QueryStateMachineRef,
-    ) -> Result<Output, ExecutionError> {
-        let mut schema = query_state_machine
-            .catalog
-            .database(&self.stmt.database_name)
-            .context(execution::MetadataSnafu)?;
+    async fn execute(&self, query_state_machine: QueryStateMachineRef) -> Result<Output> {
+        let tenant = query_state_machine.session.tenant();
+        let client = query_state_machine
+            .meta
+            .tenant_manager()
+            .tenant_meta(tenant)
+            .await
+            .ok_or(MetaError::TenantNotFound {
+                tenant: tenant.to_string(),
+            })?;
+        // .context(MetaSnafu)?;
+        let mut schema = client
+            .get_db_schema(&self.stmt.database_name)?
+            // .context(spi::MetaSnafu)?
+            .ok_or(MetaError::DatabaseNotFound {
+                database: self.stmt.database_name.clone(),
+            })?;
+        // .context(spi::MetaSnafu)?;
         build_database_schema(&self.stmt.database_options, &mut schema.config);
-        query_state_machine
-            .catalog
-            .alter_database(schema)
-            .context(execution::MetadataSnafu)?;
+        // client
+        //     .alter_database(schema)
+        //     .context(spi::MetaSnafu)?;
+
+        client.alter_db_schema(&schema).await?;
+        // .context(spi::MetaSnafu)?;
         return Ok(Output::Nil(()));
     }
 }
@@ -49,6 +62,6 @@ fn build_database_schema(database_options: &DatabaseOptions, config: &mut Databa
         config.with_vnode_duration(vnode_duration.clone());
     }
     if let Some(precision) = database_options.precision() {
-        config.with_precision(precision.clone());
+        config.with_precision(*precision);
     }
 }

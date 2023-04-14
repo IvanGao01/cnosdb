@@ -1,22 +1,18 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::{
-    datasource::source_as_provider,
-    error::DataFusionError,
-    execution::context::SessionState,
-    logical_expr::{LogicalPlan, UserDefinedLogicalNode},
-    physical_plan::{displayable, planner::ExtensionPlanner, ExecutionPlan, PhysicalPlanner},
-};
-use trace::debug;
-use trace::trace;
+use datafusion::error::{DataFusionError, Result};
+use datafusion::execution::context::SessionState;
+use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
+use datafusion::physical_plan::planner::{create_aggregate_expr, ExtensionPlanner};
+use datafusion::physical_plan::{displayable, ExecutionPlan, PhysicalPlanner};
+use trace::{debug, trace};
 
-use crate::{
-    extension::logical::plan_node::table_writer::{as_table_writer_plan_node, TableWriterPlanNode},
-    table::ClusterTable,
-};
-
-use datafusion::error::Result;
+use crate::data_source::{source_downcast_adapter, WriteExecExt};
+use crate::extension::logical::plan_node::table_writer::TableWriterPlanNode;
+use crate::extension::logical::plan_node::table_writer_merge::TableWriterMergePlanNode;
+use crate::extension::physical::plan_node::table_writer_merge::TableWriterMergeExec;
+use crate::extension::utils::downcast_plan_node;
 
 /// Physical planner for TableWriter nodes
 pub struct TableWriterPlanner {}
@@ -34,33 +30,65 @@ impl ExtensionPlanner for TableWriterPlanner {
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
         Ok(
             if let Some(TableWriterPlanNode {
-                target_table_name,
+                target_table_name: _,
                 target_table,
                 ..
-            }) = as_table_writer_plan_node(node)
+            }) = downcast_plan_node::<TableWriterPlanNode>(node)
             {
                 debug!("Input user defined logical node: TableWriterPlanNode");
                 trace!("Full input user defined logical plan:\n{:?}", node);
 
+                debug_assert_eq!(
+                    1,
+                    physical_inputs.len(),
+                    "TableWriterPlanNode has multiple inputs."
+                );
                 let physical_input = physical_inputs[0].clone();
 
-                let table_provider = source_as_provider(target_table)?;
+                let table_provider = source_downcast_adapter(target_table)
+                    .map_err(|e| DataFusionError::External(Box::new(e)))?;
 
-                let table_writer = table_provider
-                    .as_any()
-                    .downcast_ref::<ClusterTable>()
-                    .ok_or_else(|| {
-                        debug!("Table {} not support write.", target_table_name);
+                let result = table_provider.write(session_state, physical_input).await?;
 
-                        DataFusionError::Plan(format!(
-                            "Table {} not support write.",
-                            target_table_name
-                        ))
-                    })?;
+                debug!(
+                    "After Apply TableWriterPlanner. Transformed physical plan: {}",
+                    displayable(result.as_ref()).indent()
+                );
+                trace!("Full transformed physical plan:\n {:?}", result);
 
-                debug!("Success to resolve table_writer.");
+                Some(result)
+            } else if let Some(TableWriterMergePlanNode {
+                input, agg_expr, ..
+            }) = downcast_plan_node::<TableWriterMergePlanNode>(node)
+            {
+                debug!("Input user defined logical node: TableWriterMergePlanNode");
+                trace!("Full input user defined logical plan:\n{:?}", node);
 
-                let result = table_writer.write(session_state, physical_input).await?;
+                debug_assert_eq!(
+                    1,
+                    physical_inputs.len(),
+                    "TableWriterMergePlanNode has multiple inputs."
+                );
+                let physical_input = physical_inputs[0].clone();
+
+                let logical_input_schema = input.schema();
+                let physical_input_schema = physical_input.schema();
+                let physical_aggr_expr = agg_expr
+                    .iter()
+                    .map(|e| {
+                        create_aggregate_expr(
+                            e,
+                            logical_input_schema.as_ref(),
+                            physical_input_schema.as_ref(),
+                            session_state.execution_props(),
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                let result = Arc::new(TableWriterMergeExec::try_new(
+                    physical_input,
+                    physical_aggr_expr,
+                )?);
 
                 debug!(
                     "After Apply TableWriterPlanner. Transformed physical plan: {}",

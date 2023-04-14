@@ -1,28 +1,22 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::scheduler::Scheduler;
 use futures::stream::AbortHandle;
 use futures::TryStreamExt;
 use parking_lot::Mutex;
-use snafu::ResultExt;
 use spi::query::dispatcher::{QueryInfo, QueryStatus};
-use spi::query::execution::{ExecutionError, Output};
-use spi::query::{
-    execution::{QueryExecution, QueryStateMachineRef},
-    logical_planner::QueryPlan,
-    optimizer::Optimizer,
-    ScheduleSnafu,
-};
-
-use spi::query::{QueryError, Result};
+use spi::query::execution::{Output, QueryExecution, QueryStateMachineRef};
+use spi::query::logical_planner::QueryPlan;
+use spi::query::optimizer::Optimizer;
+use spi::query::scheduler::SchedulerRef;
+use spi::{QueryError, Result};
 use trace::debug;
 
 pub struct SqlQueryExecution {
     query_state_machine: QueryStateMachineRef,
     plan: QueryPlan,
     optimizer: Arc<dyn Optimizer + Send + Sync>,
-    scheduler: Arc<Scheduler>,
+    scheduler: SchedulerRef,
 
     abort_handle: Mutex<Option<AbortHandle>>,
 }
@@ -32,7 +26,7 @@ impl SqlQueryExecution {
         query_state_machine: QueryStateMachineRef,
         plan: QueryPlan,
         optimizer: Arc<dyn Optimizer + Send + Sync>,
-        scheduler: Arc<Scheduler>,
+        scheduler: SchedulerRef,
     ) -> Self {
         Self {
             query_state_machine,
@@ -42,9 +36,7 @@ impl SqlQueryExecution {
             abort_handle: Mutex::new(None),
         }
     }
-}
 
-impl SqlQueryExecution {
     async fn start(&self) -> Result<Output> {
         // begin optimize
         self.query_state_machine.begin_optimize();
@@ -56,22 +48,20 @@ impl SqlQueryExecution {
 
         // begin schedule
         self.query_state_machine.begin_schedule();
-        let execution_result = self
+        let stream = self
             .scheduler
             .schedule(
                 optimized_physical_plan,
                 self.query_state_machine.session.inner().task_ctx(),
             )
-            .context(ScheduleSnafu)?
-            .stream()
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(|source| QueryError::Execution {
-                source: ExecutionError::Arrow { source },
-            })?;
+            .await?
+            .stream();
+        debug!("Success build result stream.");
+        let schema_ref = stream.schema();
+        let execution_result = stream.try_collect::<Vec<_>>().await?;
         self.query_state_machine.end_schedule();
 
-        Ok(Output::StreamData(execution_result))
+        Ok(Output::StreamData(schema_ref, execution_result))
     }
 }
 
@@ -116,7 +106,9 @@ impl QueryExecution for SqlQueryExecution {
         QueryInfo::new(
             qsm.query_id,
             qsm.query.content().to_string(),
-            qsm.query.context().user_info().user.to_string(),
+            *qsm.session.tenant_id(),
+            qsm.session.tenant().to_string(),
+            qsm.query.context().user_info().desc().clone(),
         )
     }
 

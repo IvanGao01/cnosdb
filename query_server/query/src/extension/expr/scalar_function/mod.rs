@@ -1,7 +1,8 @@
 #[cfg(test)]
 mod example;
 
-use spi::query::function::{FunctionMetadataManager, Result};
+use spi::query::function::FunctionMetadataManager;
+use spi::Result;
 
 pub fn register_udfs(_func_manager: &mut dyn FunctionMetadataManager) -> Result<()> {
     // extend function...
@@ -12,9 +13,10 @@ pub fn register_udfs(_func_manager: &mut dyn FunctionMetadataManager) -> Result<
 
 #[cfg(test)]
 mod tests {
+    use spi::query::function::FunctionMetadataManager;
+
     use super::example;
     use crate::function::simple_func_manager::SimpleFunctionMetadataManager;
-    use spi::query::function::FunctionMetadataManager;
 
     #[tokio::test]
     async fn test_example() {

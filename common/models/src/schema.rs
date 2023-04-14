@@ -8,17 +8,16 @@
 //!         - Column #4
 
 use std::collections::HashMap;
-use std::fmt;
-use std::{collections::BTreeMap, sync::Arc};
-
+use std::fmt::{self, Display};
 use std::mem::size_of_val;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration as StdDuration;
 
-use serde::{Deserialize, Serialize};
-
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Field as DFField};
+use config::{RequestLimiterConfig, TenantLimiterConfig, TenantObjectLimiterConfig};
 use datafusion::arrow::datatypes::{
-    DataType as ArrowDataType, Field as ArrowField, SchemaRef, TimeUnit,
+    DataType as ArrowDataType, Field as ArrowField, Schema, SchemaRef, TimeUnit,
 };
 use datafusion::datasource::file_format::avro::AvroFormat;
 use datafusion::datasource::file_format::csv::CsvFormat;
@@ -27,12 +26,21 @@ use datafusion::datasource::file_format::json::JsonFormat;
 use datafusion::datasource::file_format::parquet::ParquetFormat;
 use datafusion::datasource::file_format::FileFormat;
 use datafusion::datasource::listing::ListingOptions;
-use datafusion::error::{DataFusionError, Result as DataFusionResult};
+use datafusion::error::Result as DataFusionResult;
+use datafusion::prelude::Column;
+use datafusion::scalar::ScalarValue;
+use derive_builder::Builder;
+use serde::{Deserialize, Serialize};
 
 use crate::codec::Encoding;
-use crate::{ColumnId, SchemaId, ValueType};
+use crate::oid::{Identifier, Oid};
+use crate::utils::{
+    DAY_MICROS, DAY_MILLS, DAY_NANOS, HOUR_MICROS, HOUR_MILLS, HOUR_NANOS, MINUTES_MICROS,
+    MINUTES_MILLS, MINUTES_NANOS,
+};
+use crate::{ColumnId, Error, SchemaId, Timestamp, ValueType};
 
-pub type TableSchemaRef = Arc<TskvTableSchema>;
+pub type TskvTableSchemaRef = Arc<TskvTableSchema>;
 
 pub const TIME_FIELD_NAME: &str = "time";
 
@@ -40,10 +48,16 @@ pub const FIELD_ID: &str = "_field_id";
 pub const TAG: &str = "_tag";
 pub const TIME_FIELD: &str = "time";
 
+pub const DEFAULT_DATABASE: &str = "public";
+pub const USAGE_SCHEMA: &str = "usage_schema";
+pub const DEFAULT_CATALOG: &str = "cnosdb";
+pub const DEFAULT_PRECISION: &str = "NS";
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum TableSchema {
-    TsKvTableSchema(TskvTableSchema),
-    ExternalTableSchema(ExternalTableSchema),
+    TsKvTableSchema(Arc<TskvTableSchema>),
+    ExternalTableSchema(Arc<ExternalTableSchema>),
+    StreamTableSchema(Arc<StreamTable>),
 }
 
 impl TableSchema {
@@ -51,6 +65,7 @@ impl TableSchema {
         match self {
             TableSchema::TsKvTableSchema(schema) => schema.name.clone(),
             TableSchema::ExternalTableSchema(schema) => schema.name.clone(),
+            TableSchema::StreamTableSchema(schema) => schema.name().into(),
         }
     }
 
@@ -58,19 +73,37 @@ impl TableSchema {
         match self {
             TableSchema::TsKvTableSchema(schema) => schema.db.clone(),
             TableSchema::ExternalTableSchema(schema) => schema.db.clone(),
+            TableSchema::StreamTableSchema(schema) => schema.db().into(),
+        }
+    }
+
+    pub fn engine_name(&self) -> &str {
+        match self {
+            TableSchema::TsKvTableSchema(_) => "TSKV",
+            TableSchema::ExternalTableSchema(_) => "EXTERNAL",
+            TableSchema::StreamTableSchema(_) => "STREAM",
+        }
+    }
+
+    pub fn to_arrow_schema(&self) -> SchemaRef {
+        match self {
+            Self::ExternalTableSchema(e) => Arc::new(e.schema.clone()),
+            Self::TsKvTableSchema(e) => e.to_arrow_schema(),
+            Self::StreamTableSchema(e) => e.schema(),
         }
     }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ExternalTableSchema {
+    pub tenant: String,
     pub db: String,
     pub name: String,
     pub file_compression_type: String,
     pub file_type: String,
     pub location: String,
     pub target_partitions: usize,
-    pub table_partition_cols: Vec<String>,
+    pub table_partition_cols: Vec<(String, DataType)>,
     pub has_header: bool,
     pub delimiter: u8,
     pub schema: Schema,
@@ -78,42 +111,35 @@ pub struct ExternalTableSchema {
 
 impl ExternalTableSchema {
     pub fn table_options(&self) -> DataFusionResult<ListingOptions> {
-        let file_format: Arc<dyn FileFormat> = match FileType::from_str(&self.file_type)? {
+        let file_compression_type = FileCompressionType::from_str(&self.file_compression_type)?;
+        let file_type = FileType::from_str(&self.file_type)?;
+        let file_extension =
+            file_type.get_ext_with_compression(self.file_compression_type.to_owned().parse()?)?;
+        let file_format: Arc<dyn FileFormat> = match file_type {
             FileType::CSV => Arc::new(
                 CsvFormat::default()
                     .with_has_header(self.has_header)
                     .with_delimiter(self.delimiter)
-                    .with_file_compression_type(
-                        FileCompressionType::from_str(&self.file_compression_type).map_err(
-                            |_| {
-                                DataFusionError::Execution(
-                                    "Only known FileCompressionTypes can be ListingTables!"
-                                        .to_string(),
-                                )
-                            },
-                        )?,
-                    ),
+                    .with_file_compression_type(file_compression_type),
             ),
             FileType::PARQUET => Arc::new(ParquetFormat::default()),
             FileType::AVRO => Arc::new(AvroFormat::default()),
-            FileType::JSON => Arc::new(JsonFormat::default().with_file_compression_type(
-                FileCompressionType::from_str(&self.file_compression_type)?,
-            )),
+            FileType::JSON => {
+                Arc::new(JsonFormat::default().with_file_compression_type(file_compression_type))
+            }
         };
 
-        Ok(ListingOptions {
-            format: file_format,
-            collect_stat: false,
-            file_extension: FileType::from_str(&self.file_type)?
-                .get_ext_with_compression(self.file_compression_type.to_owned().parse()?)?,
-            target_partitions: self.target_partitions,
-            table_partition_cols: self.table_partition_cols.clone(),
-        })
+        let options = ListingOptions::new(file_format)
+            .with_file_extension(file_extension)
+            .with_target_partitions(self.target_partitions);
+
+        Ok(options)
     }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct TskvTableSchema {
+    pub tenant: String,
     pub db: String,
     pub name: String,
     pub schema_id: SchemaId,
@@ -127,8 +153,9 @@ pub struct TskvTableSchema {
 impl Default for TskvTableSchema {
     fn default() -> Self {
         Self {
+            tenant: "cnosdb".to_string(),
             db: "public".to_string(),
-            name: "".to_string(),
+            name: "template".to_string(),
             schema_id: 0,
             next_column_id: 0,
             columns: Default::default(),
@@ -139,12 +166,15 @@ impl Default for TskvTableSchema {
 
 impl TskvTableSchema {
     pub fn to_arrow_schema(&self) -> SchemaRef {
-        let fields: Vec<ArrowField> = self.columns.iter().map(|field| field.into()).collect();
-
+        let fields: Vec<ArrowField> = self
+            .columns
+            .iter()
+            .map(|field| field.to_arrow_field())
+            .collect();
         Arc::new(Schema::new(fields))
     }
 
-    pub fn new(db: String, name: String, columns: Vec<TableColumn>) -> Self {
+    pub fn new(tenant: String, db: String, name: String, columns: Vec<TableColumn>) -> Self {
         let columns_index = columns
             .iter()
             .enumerate()
@@ -152,6 +182,7 @@ impl TskvTableSchema {
             .collect();
 
         Self {
+            tenant,
             db,
             name,
             schema_id: 0,
@@ -159,6 +190,16 @@ impl TskvTableSchema {
             columns,
             columns_index,
         }
+    }
+
+    /// only for mock!!!
+    pub fn new_test() -> Self {
+        TskvTableSchema::new(
+            "cnosdb".into(),
+            "public".into(),
+            "test".into(),
+            vec![TableColumn::new_time_column(0, TimeUnit::Second)],
+        )
     }
 
     /// add column
@@ -203,9 +244,17 @@ impl TskvTableSchema {
             .map(|idx| unsafe { self.columns.get_unchecked(*idx) })
     }
 
+    pub fn time_column_precision(&self) -> Precision {
+        self.columns
+            .iter()
+            .find(|column| column.column_type.is_time())
+            .map(|column| column.column_type.precision().unwrap_or(Precision::NS))
+            .unwrap_or(Precision::NS)
+    }
+
     /// Get the index of the column
-    pub fn column_index(&self, name: &str) -> Option<&usize> {
-        self.columns_index.get(name)
+    pub fn column_index(&self, name: &str) -> Option<usize> {
+        self.columns_index.get(name).cloned()
     }
 
     pub fn column_name(&self, id: ColumnId) -> Option<&str> {
@@ -234,6 +283,21 @@ impl TskvTableSchema {
             .collect()
     }
 
+    /// Traverse and return the time column of the table
+    ///
+    /// Do not call frequently
+    pub fn time_column(&self) -> TableColumn {
+        // There is one and only one time column
+        unsafe {
+            self.columns
+                .iter()
+                .filter(|column| column.column_type.is_time())
+                .last()
+                .cloned()
+                .unwrap_unchecked()
+        }
+    }
+
     /// Number of columns of ColumnType is Field
     pub fn field_num(&self) -> usize {
         self.columns
@@ -249,11 +313,20 @@ impl TskvTableSchema {
             .count()
     }
 
+    pub fn tag_indices(&self) -> Vec<usize> {
+        self.columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.column_type.is_tag())
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
     // return (table_field_id, index), index mean field location which column
     pub fn fields_id(&self) -> HashMap<ColumnId, usize> {
         let mut ans = vec![];
         for i in self.columns.iter() {
-            if i.column_type != ColumnType::Tag && i.column_type != ColumnType::Time {
+            if matches!(i.column_type, ColumnType::Field(_)) {
                 ans.push(i.id);
             }
         }
@@ -265,18 +338,16 @@ impl TskvTableSchema {
         map
     }
 
-    pub fn next_column_id(&mut self) -> ColumnId {
-        let ans = self.next_column_id;
-        self.next_column_id += 1;
-        ans
+    pub fn next_column_id(&self) -> ColumnId {
+        self.next_column_id
     }
 
     pub fn size(&self) -> usize {
         let mut size = 0;
         for i in self.columns.iter() {
-            size += size_of_val(&i);
+            size += size_of_val(i);
         }
-        size += size_of_val(&self);
+        size += size_of_val(self);
         size
     }
 
@@ -297,20 +368,21 @@ pub struct TableColumn {
     pub encoding: Encoding,
 }
 
-impl From<&TableColumn> for ArrowField {
-    fn from(column: &TableColumn) -> Self {
-        let mut f = ArrowField::new(&column.name, column.column_type.into(), column.nullable());
-        let mut map = BTreeMap::new();
+impl From<TableColumn> for ArrowField {
+    fn from(column: TableColumn) -> Self {
+        let mut map = HashMap::new();
         map.insert(FIELD_ID.to_string(), column.id.to_string());
         map.insert(TAG.to_string(), column.column_type.is_tag().to_string());
-        f.set_metadata(Some(map));
+        let nullable = column.nullable();
+        let mut f = ArrowField::new(&column.name, column.column_type.into(), nullable);
+        f.set_metadata(map);
         f
     }
 }
 
-impl From<TableColumn> for ArrowField {
+impl From<TableColumn> for Column {
     fn from(field: TableColumn) -> Self {
-        (&field).into()
+        Column::from_name(field.name)
     }
 }
 
@@ -332,11 +404,11 @@ impl TableColumn {
         }
     }
 
-    pub fn new_time_column(id: ColumnId) -> TableColumn {
+    pub fn new_time_column(id: ColumnId, time_unit: TimeUnit) -> TableColumn {
         TableColumn {
             id,
             name: TIME_FIELD_NAME.to_string(),
-            column_type: ColumnType::Time,
+            column_type: ColumnType::Time(time_unit),
             encoding: Encoding::Default,
         }
     }
@@ -352,21 +424,44 @@ impl TableColumn {
 
     pub fn nullable(&self) -> bool {
         // The time column cannot be empty
-        !matches!(self.column_type, ColumnType::Time)
+        !matches!(self.column_type, ColumnType::Time(_))
+    }
+
+    pub fn encode(&self) -> crate::errors::Result<Vec<u8>> {
+        let buf = bincode::serialize(&self)
+            .map_err(|e| Error::InvalidSerdeMessage { err: e.to_string() })?;
+
+        Ok(buf)
+    }
+
+    pub fn decode(buf: &[u8]) -> crate::errors::Result<Self> {
+        let column = bincode::deserialize::<TableColumn>(buf)
+            .map_err(|e| Error::InvalidSerdeMessage { err: e.to_string() })?;
+
+        Ok(column)
+    }
+
+    pub fn to_arrow_field(&self) -> ArrowField {
+        let mut f = ArrowField::new(&self.name, self.column_type.clone().into(), self.nullable());
+        let mut map = HashMap::new();
+        map.insert(FIELD_ID.to_string(), self.id.to_string());
+        map.insert(TAG.to_string(), self.column_type.is_tag().to_string());
+        f.set_metadata(map);
+        f
     }
 }
 
 impl From<ColumnType> for ArrowDataType {
     fn from(t: ColumnType) -> Self {
         match t {
-            ColumnType::Tag => Self::Utf8,
-            ColumnType::Time => Self::Timestamp(TimeUnit::Nanosecond, None),
-            ColumnType::Field(ValueType::Float) => Self::Float64,
-            ColumnType::Field(ValueType::Integer) => Self::Int64,
-            ColumnType::Field(ValueType::Unsigned) => Self::UInt64,
-            ColumnType::Field(ValueType::String) => Self::Utf8,
-            ColumnType::Field(ValueType::Boolean) => Self::Boolean,
-            _ => Self::Null,
+            ColumnType::Tag => ArrowDataType::Utf8,
+            ColumnType::Time(unit) => ArrowDataType::Timestamp(unit, None),
+            ColumnType::Field(ValueType::Float) => ArrowDataType::Float64,
+            ColumnType::Field(ValueType::Integer) => ArrowDataType::Int64,
+            ColumnType::Field(ValueType::Unsigned) => ArrowDataType::UInt64,
+            ColumnType::Field(ValueType::String) => ArrowDataType::Utf8,
+            ColumnType::Field(ValueType::Boolean) => ArrowDataType::Boolean,
+            _ => ArrowDataType::Null,
         }
     }
 }
@@ -386,23 +481,28 @@ impl TryFrom<ArrowDataType> for ColumnType {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ColumnType {
     Tag,
-    Time,
+    Time(TimeUnit),
     Field(ValueType),
 }
 
 impl ColumnType {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::Tag => "tag",
-            Self::Time => "time",
-            Self::Field(ValueType::Integer) => "i64",
-            Self::Field(ValueType::Unsigned) => "u64",
-            Self::Field(ValueType::Float) => "f64",
-            Self::Field(ValueType::Boolean) => "bool",
-            Self::Field(ValueType::String) => "string",
+            Self::Tag => "TAG",
+            Self::Time(unit) => match unit {
+                TimeUnit::Second => "TimestampSecond",
+                TimeUnit::Millisecond => "TimestampMillisecond",
+                TimeUnit::Microsecond => "TimestampMicrosecond",
+                TimeUnit::Nanosecond => "TimestampNanosecond",
+            },
+            Self::Field(ValueType::Integer) => "I64",
+            Self::Field(ValueType::Unsigned) => "U64",
+            Self::Field(ValueType::Float) => "F64",
+            Self::Field(ValueType::Boolean) => "BOOL",
+            Self::Field(ValueType::String) => "STRING",
             _ => "Error filed type not supported",
         }
     }
@@ -411,7 +511,7 @@ impl ColumnType {
         match self {
             Self::Tag => "TAG",
             Self::Field(_) => "FIELD",
-            Self::Time => "TIME",
+            Self::Time(_) => "TIME",
         }
     }
 
@@ -433,7 +533,6 @@ impl ColumnType {
             2 => Self::Field(ValueType::Unsigned),
             3 => Self::Field(ValueType::Boolean),
             4 => Self::Field(ValueType::String),
-            5 => Self::Time,
             _ => Self::Field(ValueType::Unknown),
         }
     }
@@ -441,7 +540,7 @@ impl ColumnType {
     pub fn to_sql_type_str(&self) -> &'static str {
         match self {
             Self::Tag => "STRING",
-            Self::Time => "TIMESTAMP",
+            Self::Time(_) => "TIMESTAMP",
             Self::Field(value_type) => match value_type {
                 ValueType::String => "STRING",
                 ValueType::Integer => "BIGINT",
@@ -454,8 +553,8 @@ impl ColumnType {
     }
 }
 
-impl std::fmt::Display for ColumnType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Display for ColumnType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::fmt::Result {
         let s = self.as_str();
         write!(f, "{}", s)
     }
@@ -467,7 +566,19 @@ impl ColumnType {
     }
 
     pub fn is_time(&self) -> bool {
-        matches!(self, ColumnType::Time)
+        matches!(self, ColumnType::Time(_))
+    }
+
+    pub fn precision(&self) -> Option<Precision> {
+        match self {
+            ColumnType::Time(unit) => match unit {
+                TimeUnit::Millisecond => Some(Precision::MS),
+                TimeUnit::Microsecond => Some(Precision::US),
+                TimeUnit::Nanosecond => Some(Precision::NS),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     pub fn is_field(&self) -> bool {
@@ -475,19 +586,85 @@ impl ColumnType {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+impl From<ValueType> for ColumnType {
+    fn from(value: ValueType) -> Self {
+        Self::Field(value)
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct DatabaseSchema {
-    pub name: String,
+    tenant: String,
+    database: String,
     pub config: DatabaseOptions,
 }
 
 impl DatabaseSchema {
-    pub fn new(name: &str) -> Self {
+    pub fn new(tenant_name: &str, database_name: &str) -> Self {
         DatabaseSchema {
-            name: name.to_string(),
+            tenant: tenant_name.to_string(),
+            database: database_name.to_string(),
             config: DatabaseOptions::default(),
         }
     }
+
+    pub fn database_name(&self) -> &str {
+        &self.database
+    }
+
+    pub fn tenant_name(&self) -> &str {
+        &self.tenant
+    }
+
+    pub fn owner(&self) -> String {
+        make_owner(&self.tenant, &self.database)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        if self.tenant.is_empty() && self.database.is_empty() {
+            return true;
+        }
+
+        false
+    }
+
+    pub fn options(&self) -> &DatabaseOptions {
+        &self.config
+    }
+
+    // return the min timestamp value database allowed to store
+    pub fn time_to_expired(&self) -> i64 {
+        let (ttl, now) = match self.config.precision_or_default() {
+            Precision::MS => (
+                self.config.ttl_or_default().to_millisecond(),
+                crate::utils::now_timestamp_millis(),
+            ),
+            Precision::US => (
+                self.config.ttl_or_default().to_microseconds(),
+                crate::utils::now_timestamp_micros(),
+            ),
+            Precision::NS => (
+                self.config.ttl_or_default().to_nanoseconds(),
+                crate::utils::now_timestamp_nanos(),
+            ),
+        };
+        now - ttl
+    }
+}
+
+pub fn make_owner(tenant_name: &str, database_name: &str) -> String {
+    format!("{}.{}", tenant_name, database_name)
+}
+
+pub fn split_owner(owner: &str) -> (&str, &str) {
+    owner
+        .find('.')
+        .map(|index| {
+            (index < owner.len())
+                .then(|| (&owner[..index], &owner[(index + 1)..]))
+                .unwrap_or((owner, ""))
+        })
+        .unwrap_or_default()
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone, PartialEq, Eq, Hash)]
@@ -582,11 +759,50 @@ impl DatabaseOptions {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
 pub enum Precision {
-    MS,
+    MS = 0,
     US,
     NS,
+}
+
+impl From<u8> for Precision {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => Precision::MS,
+            1 => Precision::US,
+            2 => Precision::NS,
+            _ => Precision::NS,
+        }
+    }
+}
+
+impl Default for Precision {
+    fn default() -> Self {
+        Self::NS
+    }
+}
+
+impl From<TimeUnit> for Precision {
+    fn from(value: TimeUnit) -> Self {
+        match value {
+            TimeUnit::Millisecond => Precision::MS,
+            TimeUnit::Microsecond => Precision::US,
+            TimeUnit::Nanosecond => Precision::NS,
+            _ => Precision::NS,
+        }
+    }
+}
+
+impl From<Precision> for TimeUnit {
+    fn from(value: Precision) -> Self {
+        match value {
+            Precision::MS => TimeUnit::Millisecond,
+            Precision::US => TimeUnit::Microsecond,
+            Precision::NS => TimeUnit::Nanosecond,
+        }
+    }
 }
 
 impl Precision {
@@ -600,7 +816,17 @@ impl Precision {
     }
 }
 
-impl fmt::Display for Precision {
+pub fn timestamp_convert(from: Precision, to: Precision, ts: Timestamp) -> Option<Timestamp> {
+    match (from, to) {
+        (Precision::NS, Precision::US) | (Precision::US, Precision::MS) => Some(ts / 1_000),
+        (Precision::MS, Precision::US) | (Precision::US, Precision::NS) => ts.checked_mul(1_000),
+        (Precision::NS, Precision::MS) => Some(ts / 1_000_000),
+        (Precision::MS, Precision::NS) => ts.checked_mul(1_000_000),
+        _ => Some(ts),
+    }
+}
+
+impl Display for Precision {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Precision::MS => f.write_str("MS"),
@@ -634,6 +860,13 @@ impl fmt::Display for Duration {
 }
 
 impl Duration {
+    pub fn new_with_day(day: u64) -> Self {
+        Self {
+            time_num: day,
+            unit: DurationUnit::Day,
+        }
+    }
+
     // with default DurationUnit day
     pub fn new(text: &str) -> Option<Self> {
         if text.is_empty() {
@@ -665,5 +898,276 @@ impl Duration {
             time_num,
             unit: time_unit,
         })
+    }
+
+    pub fn new_inf() -> Self {
+        Self {
+            time_num: 100000,
+            unit: DurationUnit::Day,
+        }
+    }
+
+    pub fn to_nanoseconds(&self) -> i64 {
+        match self.unit {
+            DurationUnit::Minutes => (self.time_num as i64).saturating_mul(MINUTES_NANOS),
+            DurationUnit::Hour => (self.time_num as i64).saturating_mul(HOUR_NANOS),
+            DurationUnit::Day => (self.time_num as i64).saturating_mul(DAY_NANOS),
+        }
+    }
+
+    pub fn to_microseconds(&self) -> i64 {
+        match self.unit {
+            DurationUnit::Minutes => (self.time_num as i64).saturating_mul(MINUTES_MICROS),
+            DurationUnit::Hour => (self.time_num as i64).saturating_mul(HOUR_MICROS),
+            DurationUnit::Day => (self.time_num as i64).saturating_mul(DAY_MICROS),
+        }
+    }
+
+    pub fn to_millisecond(&self) -> i64 {
+        match self.unit {
+            DurationUnit::Minutes => (self.time_num as i64).saturating_mul(MINUTES_MILLS),
+            DurationUnit::Hour => (self.time_num as i64).saturating_mul(HOUR_MILLS),
+            DurationUnit::Day => (self.time_num as i64).saturating_mul(DAY_MILLS),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tenant {
+    id: Oid,
+    name: String,
+    options: TenantOptions,
+}
+
+impl Identifier<Oid> for Tenant {
+    fn id(&self) -> &Oid {
+        &self.id
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl Tenant {
+    pub fn new(id: Oid, name: String, options: TenantOptions) -> Self {
+        Self { id, name, options }
+    }
+
+    pub fn options(&self) -> &TenantOptions {
+        &self.options
+    }
+
+    pub fn to_own_options(self) -> TenantOptions {
+        self.options
+    }
+}
+
+#[derive(Debug, Default, Clone, Builder, Serialize, Deserialize)]
+#[builder(setter(into, strip_option), default)]
+pub struct TenantOptions {
+    pub comment: Option<String>,
+    pub limiter_config: Option<TenantLimiterConfig>,
+}
+
+impl From<TenantOptions> for TenantOptionsBuilder {
+    fn from(value: TenantOptions) -> Self {
+        let mut builder = TenantOptionsBuilder::default();
+        if let Some(comment) = value.comment {
+            builder.comment(comment);
+        }
+        if let Some(config) = value.limiter_config {
+            builder.limiter_config(config);
+        }
+        builder
+    }
+}
+
+impl TenantOptionsBuilder {
+    pub fn unset_comment(&mut self) {
+        self.comment = None
+    }
+    pub fn unset_limiter_config(&mut self) {
+        self.limiter_config = None
+    }
+}
+
+impl TenantOptions {
+    pub fn object_config(&self) -> Option<&TenantObjectLimiterConfig> {
+        match self.limiter_config {
+            Some(ref limit_config) => limit_config.object_config.as_ref(),
+            None => None,
+        }
+    }
+
+    pub fn request_config(&self) -> Option<&RequestLimiterConfig> {
+        match self.limiter_config {
+            Some(ref limit_config) => limit_config.request_config.as_ref(),
+            None => None,
+        }
+    }
+}
+
+impl Display for TenantOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(ref e) = self.comment {
+            write!(f, "comment={},", e)?;
+        }
+
+        if let Some(ref e) = self.limiter_config {
+            write!(f, "limiter={e:?},")?;
+        } else {
+            write!(f, "limiter=None,")?;
+        }
+
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct Watermark {
+    pub column: String,
+    pub delay: StdDuration,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct StreamTable {
+    tenant: String,
+    db: String,
+    name: String,
+    schema: SchemaRef,
+    stream_type: String,
+    watermark: Watermark,
+    extra_options: HashMap<String, String>,
+}
+
+impl StreamTable {
+    pub fn new(
+        tenant: impl Into<String>,
+        db: impl Into<String>,
+        name: impl Into<String>,
+        schema: SchemaRef,
+        stream_type: impl Into<String>,
+        watermark: Watermark,
+        extra_options: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            tenant: tenant.into(),
+            db: db.into(),
+            name: name.into(),
+            schema,
+            stream_type: stream_type.into(),
+            watermark,
+            extra_options,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn tenant(&self) -> &str {
+        &self.tenant
+    }
+
+    pub fn db(&self) -> &str {
+        &self.db
+    }
+
+    pub fn stream_type(&self) -> &str {
+        &self.stream_type
+    }
+
+    pub fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    pub fn watermark(&self) -> &Watermark {
+        &self.watermark
+    }
+
+    pub fn extra_options(&self) -> &HashMap<String, String> {
+        &self.extra_options
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub enum ScalarValueForkDF {
+    /// represents `DataType::Null` (castable to/from any other type)
+    Null,
+    /// true or false value
+    Boolean(Option<bool>),
+    /// 32bit float
+    Float32(Option<f32>),
+    /// 64bit float
+    Float64(Option<f64>),
+    /// 128bit decimal, using the i128 to represent the decimal, precision scale
+    Decimal128(Option<i128>, u8, u8),
+    /// signed 8bit int
+    Int8(Option<i8>),
+    /// signed 16bit int
+    Int16(Option<i16>),
+    /// signed 32bit int
+    Int32(Option<i32>),
+    /// signed 64bit int
+    Int64(Option<i64>),
+    /// unsigned 8bit int
+    UInt8(Option<u8>),
+    /// unsigned 16bit int
+    UInt16(Option<u16>),
+    /// unsigned 32bit int
+    UInt32(Option<u32>),
+    /// unsigned 64bit int
+    UInt64(Option<u64>),
+    /// utf-8 encoded string.
+    Utf8(Option<String>),
+    /// utf-8 encoded string representing a LargeString's arrow type.
+    LargeUtf8(Option<String>),
+    /// binary
+    Binary(Option<Vec<u8>>),
+    /// fixed size binary
+    FixedSizeBinary(i32, Option<Vec<u8>>),
+    /// large binary
+    LargeBinary(Option<Vec<u8>>),
+    /// list of nested ScalarValue
+    List(Option<Vec<ScalarValueForkDF>>, Box<DFField>),
+    /// Date stored as a signed 32bit int days since UNIX epoch 1970-01-01
+    Date32(Option<i32>),
+    /// Date stored as a signed 64bit int milliseconds since UNIX epoch 1970-01-01
+    Date64(Option<i64>),
+    /// Time stored as a signed 64bit int as nanoseconds since midnight
+    Time64(Option<i64>),
+    /// Timestamp Second
+    TimestampSecond(Option<i64>, Option<String>),
+    /// Timestamp Milliseconds
+    TimestampMillisecond(Option<i64>, Option<String>),
+    /// Timestamp Microseconds
+    TimestampMicrosecond(Option<i64>, Option<String>),
+    /// Timestamp Nanoseconds
+    TimestampNanosecond(Option<i64>, Option<String>),
+    /// Number of elapsed whole months
+    IntervalYearMonth(Option<i32>),
+    /// Number of elapsed days and milliseconds (no leap seconds)
+    /// stored as 2 contiguous 32-bit signed integers
+    IntervalDayTime(Option<i64>),
+    /// A triple of the number of elapsed months, days, and nanoseconds.
+    /// Months and days are encoded as 32-bit signed integers.
+    /// Nanoseconds is encoded as a 64-bit signed integer (no leap seconds).
+    IntervalMonthDayNano(Option<i128>),
+    /// struct of nested ScalarValue
+    Struct(Option<Vec<ScalarValueForkDF>>, Box<Vec<DFField>>),
+    /// Dictionary type: index type and value
+    Dictionary(Box<ArrowDataType>, Box<ScalarValueForkDF>),
+}
+
+impl From<ScalarValue> for ScalarValueForkDF {
+    fn from(value: ScalarValue) -> Self {
+        unsafe { std::mem::transmute::<ScalarValue, Self>(value) }
+    }
+}
+
+impl From<ScalarValueForkDF> for ScalarValue {
+    fn from(value: ScalarValueForkDF) -> Self {
+        unsafe { std::mem::transmute::<ScalarValueForkDF, Self>(value) }
     }
 }

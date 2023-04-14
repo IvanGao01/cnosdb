@@ -1,10 +1,11 @@
-use std::{collections::HashMap, ops::Deref, sync::Arc};
+use std::collections::HashMap;
+use std::ops::Deref;
+use std::sync::Arc;
 
 use parking_lot::RwLock;
-use spi::{
-    query::{execution::QueryExecution, QueryError},
-    service::protocol::QueryId,
-};
+use spi::query::execution::{QueryExecution, QueryType};
+use spi::service::protocol::QueryId;
+use spi::QueryError;
 use tokio::sync::{Semaphore, SemaphorePermit, TryAcquireError};
 use trace::{debug, warn};
 
@@ -83,8 +84,8 @@ impl QueryTracker {
         self.query_limit_semaphore.close();
     }
 
-    fn expire_query(&self, id: &QueryId) {
-        self.queries.write().remove(id);
+    pub fn expire_query(&self, id: &QueryId) -> Option<Arc<dyn QueryExecution>> {
+        self.queries.write().remove(id)
     }
 }
 
@@ -105,25 +106,29 @@ impl Deref for TrackedQuery<'_> {
 
 impl Drop for TrackedQuery<'_> {
     fn drop(&mut self) {
-        debug!("TrackedQuery drop: {:?}", &self.query_id);
-        self.tracker.expire_query(&self.query_id);
+        match self.query.query_type() {
+            QueryType::Batch => {
+                debug!("TrackedQuery drop: {:?}", &self.query_id);
+                let _ = self.tracker.expire_query(&self.query_id);
+            }
+            QueryType::Stream => {
+                // 流任务是常驻任务，需要手动kill
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use async_trait::async_trait;
-    use spi::{
-        query::{
-            dispatcher::{QueryInfo, QueryStatus},
-            execution::{Output, QueryExecution, QueryState, RUNNING},
-            QueryError,
-        },
-        service::protocol::QueryId,
-    };
-    use std::time::Duration;
+    use models::auth::user::{UserDesc, UserOptions};
+    use spi::query::dispatcher::{QueryInfo, QueryStatus};
+    use spi::query::execution::{Output, QueryExecution, QueryState, RUNNING};
+    use spi::service::protocol::QueryId;
+    use spi::QueryError;
 
     use super::QueryTracker;
 
@@ -138,7 +143,15 @@ mod tests {
             Ok(())
         }
         fn info(&self) -> QueryInfo {
-            QueryInfo::new(1_u64.into(), "test".to_string(), "UNKNOWN".to_string())
+            let options = UserOptions::default();
+            let desc = UserDesc::new(0_u128, "user".to_string(), options, true);
+            QueryInfo::new(
+                1_u64.into(),
+                "test".to_string(),
+                0_u128,
+                "tenant".to_string(),
+                desc,
+            )
         }
         fn status(&self) -> QueryStatus {
             QueryStatus::new(

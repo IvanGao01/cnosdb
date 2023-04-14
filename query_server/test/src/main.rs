@@ -2,10 +2,9 @@ use std::env::current_exe;
 use std::path::PathBuf;
 
 use clap::Parser;
+use groups::TestGroups;
 use lazy_static::lazy_static;
 use reqwest::Url;
-
-use groups::TestGroups;
 
 use crate::client::Client;
 use crate::error::{Error, Result};
@@ -13,24 +12,28 @@ use crate::error::{Error, Result};
 mod case;
 mod client;
 mod db_request;
+mod db_result;
 mod error;
 mod groups;
 
-#[derive(Parser, Debug)]
-#[clap(author, version = "0.1.0", about, long_about = None)]
+#[derive(Debug, Parser)]
+#[command(author, version = "0.1.0", about, long_about = None)]
 pub struct Args {
     /// client url
-    #[clap(
+    #[arg(
         short,
         long,
         value_parser,
-        default_value = "http://127.0.0.1:31007/api/v1/"
+        default_value = "http://127.0.0.1:8902/api/v1/"
     )]
     pub client_url: Url,
 
     /// work thread num
-    #[clap(short, long, value_parser, default_value = "4")]
+    #[arg(short, long, value_parser, default_value = "4")]
     pub thread: usize,
+
+    #[arg(short, long)]
+    pub pattern: Option<String>,
 }
 
 fn default_case_path() -> Result<PathBuf> {
@@ -63,7 +66,7 @@ fn main() -> Result<()> {
         .unwrap();
 
     let case_path = default_case_path()?;
-    let mut groups = TestGroups::load(&case_path)?;
+    let mut groups = TestGroups::load(&case_path, ARGS.pattern.clone())?;
 
     let ping = rt.block_on(CLIENT.ping());
     //TODO (ADD startup db)

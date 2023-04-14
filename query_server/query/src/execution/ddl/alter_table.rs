@@ -1,42 +1,100 @@
-use crate::execution::ddl::query::execution::MetadataSnafu;
-use crate::execution::ddl::DDLDefinitionTask;
-use async_trait::async_trait;
-use snafu::ResultExt;
+use std::sync::Arc;
 
-use spi::query::execution::{ExecutionError, Output, QueryStateMachineRef};
+use async_trait::async_trait;
+use meta::error::MetaError;
+use models::schema::TableSchema;
+use protos::kv_service::admin_command_request::Command;
+use protos::kv_service::{
+    AddColumnRequest, AdminCommandRequest, AlterColumnRequest, DropColumnRequest,
+};
+use spi::query::execution::{Output, QueryStateMachineRef};
 use spi::query::logical_planner::{AlterTable, AlterTableAction};
+use spi::Result;
+
+// use crate::execution::ddl::query::spi::MetaSnafu;
+use crate::execution::ddl::DDLDefinitionTask;
 
 pub struct AlterTableTask {
-    _stmt: AlterTable,
+    stmt: AlterTable,
 }
 
 impl AlterTableTask {
     pub fn new(stmt: AlterTable) -> AlterTableTask {
-        Self { _stmt: stmt }
+        Self { stmt }
     }
 }
 #[async_trait]
 impl DDLDefinitionTask for AlterTableTask {
-    async fn execute(
-        &self,
-        query_state_machine: QueryStateMachineRef,
-    ) -> Result<Output, ExecutionError> {
-        let table_name = &self._stmt.table_name;
-        let catalog = query_state_machine.catalog.clone();
-        match &self._stmt.alter_action {
-            AlterTableAction::AddColumn { table_column } => catalog
-                .alter_table_add_column(table_name, table_column.clone())
-                .context(MetadataSnafu)?,
-            AlterTableAction::DropColumn { column_name } => catalog
-                .alter_table_drop_column(table_name, column_name)
-                .context(MetadataSnafu)?,
+    async fn execute(&self, query_state_machine: QueryStateMachineRef) -> Result<Output> {
+        let table_name = &self.stmt.table_name;
+        let tenant = table_name.tenant();
+        let client = query_state_machine
+            .meta
+            .tenant_manager()
+            .tenant_meta(tenant)
+            .await
+            .ok_or(MetaError::TenantNotFound {
+                tenant: tenant.to_string(),
+            })?;
+
+        let mut schema = client
+            .get_tskv_table_schema(table_name.database(), table_name.table())?
+            .ok_or(MetaError::TableNotFound {
+                table: table_name.to_string(),
+            })?
+            .as_ref()
+            .clone();
+
+        let req = match &self.stmt.alter_action {
+            AlterTableAction::AddColumn { table_column } => {
+                let table_column = table_column.to_owned();
+                schema.add_column(table_column.clone());
+
+                AdminCommandRequest {
+                    tenant: tenant.to_string(),
+                    command: Some(Command::AddColumn(AddColumnRequest {
+                        db: schema.db.to_owned(),
+                        table: schema.name.to_string(),
+                        column: table_column.encode()?,
+                    })),
+                }
+            }
+
+            AlterTableAction::DropColumn { column_name } => {
+                schema.drop_column(column_name);
+                AdminCommandRequest {
+                    tenant: tenant.to_string(),
+                    command: Some(Command::DropColumn(DropColumnRequest {
+                        db: schema.db.to_owned(),
+                        table: schema.name.to_string(),
+                        column: column_name.clone(),
+                    })),
+                }
+            }
+
             AlterTableAction::AlterColumn {
                 column_name,
                 new_column,
-            } => catalog
-                .alter_table_alter_column(table_name, column_name, new_column.clone())
-                .context(MetadataSnafu)?,
-        }
+            } => {
+                schema.change_column(column_name, new_column.clone());
+                AdminCommandRequest {
+                    tenant: tenant.to_string(),
+                    command: Some(Command::AlterColumn(AlterColumnRequest {
+                        db: schema.db.to_owned(),
+                        table: schema.name.to_string(),
+                        name: column_name.to_owned(),
+                        column: new_column.encode()?,
+                    })),
+                }
+            }
+        };
+        schema.schema_id += 1;
+
+        client
+            .update_table(&TableSchema::TsKvTableSchema(Arc::new(schema)))
+            .await?;
+        query_state_machine.coord.broadcast_command(req).await?;
+
         return Ok(Output::Nil(()));
     }
 }

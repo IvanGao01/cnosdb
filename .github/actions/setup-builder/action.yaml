@@ -11,17 +11,19 @@ runs:
     - name: Install Build Dependencies
       shell: bash
       run: |
-        git clone https://github.com/google/flatbuffers.git
-        cd flatbuffers
-        git checkout v2.0.6
-        cmake .
-        make
-        sudo make install
-        sudo ldconfig
-        flatc --version
+        curl -o flatbuffers.zip -sL https://github.com/google/flatbuffers/releases/download/v22.9.29/Linux.flatc.binary.clang++-12.zip
+        unzip  flatbuffers.zip
+        mv flatc /usr/local/bin
     - name: Setup Rust toolchain
       shell: bash
       run: |
         echo "Installing ${{ inputs.rust-version }}"
+        source "$HOME/.cargo/env"
         rustup toolchain install ${{ inputs.rust-version }}
         rustup default ${{ inputs.rust-version }}
+    - name: Install Protoc
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler
+        protoc --version

@@ -1,15 +1,13 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::{
-    execution::context::SessionState,
-    logical_expr::{LogicalPlan, UserDefinedLogicalNode},
-    physical_plan::{planner::ExtensionPlanner, ExecutionPlan, PhysicalPlanner},
-};
+use datafusion::error::Result;
+use datafusion::execution::context::SessionState;
+use datafusion::logical_expr::{LogicalPlan, UserDefinedLogicalNode};
+use datafusion::physical_plan::planner::ExtensionPlanner;
+use datafusion::physical_plan::{ExecutionPlan, PhysicalPlanner};
 
 use crate::extension::logical::plan_node::tag_scan::TagScanPlanNode;
-
-use datafusion::error::Result;
 
 /// Physical planner for TopK nodes
 pub struct TagScanPlanner {}
@@ -23,27 +21,25 @@ impl ExtensionPlanner for TagScanPlanner {
         node: &dyn UserDefinedLogicalNode,
         _logical_inputs: &[&LogicalPlan],
         _physical_inputs: &[Arc<dyn ExecutionPlan>],
-        session_state: &SessionState,
+        _session_state: &SessionState,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        Ok(
-            if let Some(TagScanPlanNode {
-                table_name: _,
-                source,
-                projection: _,
-                projected_schema,
-                filters,
-                fetch,
-            }) = as_tag_scan_plan_node(node)
-            {
-                let tag_scan = source
-                    .tag_scan(session_state, projected_schema, filters, *fetch)
-                    .await?;
+        let res = if let Some(TagScanPlanNode {
+            table_name: _,
+            source,
+            projection: _,
+            projected_schema,
+            filters,
+            fetch,
+        }) = as_tag_scan_plan_node(node)
+        {
+            let tag_scan =
+                source.create_tag_scan_physical_plan(projected_schema, filters, *fetch)?;
 
-                Some(tag_scan)
-            } else {
-                None
-            },
-        )
+            Some(tag_scan)
+        } else {
+            None
+        };
+        Ok(res)
     }
 }
 

@@ -1,15 +1,19 @@
 use std::sync::Arc;
 
 use criterion::{criterion_group, criterion_main, Criterion};
+use datafusion::execution::memory_pool::GreedyMemoryPool;
+use meta::model::meta_manager::RemoteMetaManager;
+use meta::model::MetaRef;
+use metrics::metric_register::MetricsRegister;
+use models::schema::Precision;
 use parking_lot::Mutex;
-
+use protos::kv_service::WritePointsRequest;
+use protos::models_helper;
 use tokio::runtime::{self, Runtime};
-
-use protos::{kv_service::WritePointsRpcRequest, models_helper};
-use tskv::{engine::Engine, TsKv};
+use tskv::{Engine, TsKv};
 
 async fn get_tskv() -> TsKv {
-    let mut global_config = config::get_config("../config/config.toml");
+    let mut global_config = config::get_config_for_test();
     global_config.wal.path = "/tmp/test_bench/wal".to_string();
     let opt = tskv::kv_option::Options::from(&global_config);
 
@@ -20,12 +24,30 @@ async fn get_tskv() -> TsKv {
             .unwrap(),
     );
 
-    TsKv::open(opt, runtime).await.unwrap()
+    let meta_manager: MetaRef = RemoteMetaManager::new(
+        global_config.cluster.clone(),
+        global_config.storage.path.clone(),
+    )
+    .await;
+
+    meta_manager.admin_meta().add_data_node().await.unwrap();
+
+    let memory = Arc::new(GreedyMemoryPool::new(1024 * 1024 * 1024));
+    TsKv::open(
+        meta_manager,
+        opt,
+        runtime,
+        memory,
+        Arc::new(MetricsRegister::default()),
+    )
+    .await
+    .unwrap()
 }
 
-fn test_write(tskv: Arc<Mutex<TsKv>>, request: WritePointsRpcRequest) {
+fn test_write(tskv: Arc<Mutex<TsKv>>, request: WritePointsRequest) {
     let rt = Runtime::new().unwrap();
-    rt.block_on(tskv.lock().write(request)).unwrap();
+    rt.block_on(tskv.lock().write(0, Precision::NS, request))
+        .unwrap();
 }
 
 // fn test_insert_cache(tskv: Arc<Mutex<TsKv>>, buf: &[u8]) {
@@ -55,8 +77,12 @@ fn big_write(c: &mut Criterion) {
                 fbb.finish(points, None);
                 let points = fbb.finished_data().to_vec();
 
-                let request = WritePointsRpcRequest { version: 1, points };
-                rt.block_on(tskv.write(request)).unwrap();
+                let request = WritePointsRequest {
+                    version: 1,
+                    meta: None,
+                    points,
+                };
+                rt.block_on(tskv.write(0, Precision::NS, request)).unwrap();
             }
         })
     });
@@ -72,7 +98,11 @@ fn run(c: &mut Criterion) {
     fbb.finish(points, None);
     let points_str = fbb.finished_data();
     let points = points_str.to_vec();
-    let request = WritePointsRpcRequest { version: 1, points };
+    let request = WritePointsRequest {
+        version: 1,
+        meta: None,
+        points,
+    };
 
     // maybe 500 us
     c.bench_function("write", |b| {

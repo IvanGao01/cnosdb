@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use serde::Deserialize;
-use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::mpsc::channel;
 use tokio::sync::oneshot;
 
 use crate::case::{search_cases, Case};
@@ -61,7 +61,7 @@ impl Group {
 
     /// run in parallel and return failed cases
     pub async fn run_parallel(&self) -> Vec<Case> {
-        let (sender, mut receiver) = unbounded_channel();
+        let (sender, mut receiver) = channel(64);
         let cases = self.cases.clone();
 
         let handler = tokio::spawn(async move {
@@ -70,7 +70,7 @@ impl Group {
                 let sender = sender.clone();
                 let (tx, rx) = oneshot::channel::<Option<Case>>();
                 let handler = tokio::spawn(async move {
-                    sender.send((case.clone(), tx)).unwrap();
+                    sender.send((case.clone(), tx)).await.unwrap();
                     if let Ok(Some(case)) = rx.await {
                         Some(case)
                     } else {
@@ -112,8 +112,8 @@ pub struct TestGroups {
 }
 
 impl TestGroups {
-    pub fn load(path: &PathBuf) -> Result<Self> {
-        let cases = search_cases(path)?;
+    pub fn load(path: &PathBuf, pattern: Option<String>) -> Result<Self> {
+        let cases = search_cases(path, pattern)?;
         let toml_str = fs::read_to_string(path.join("TestGroups.toml")).unwrap();
         let mut res: TestGroups = toml::from_str(&toml_str).unwrap();
         res.load_cases(cases);

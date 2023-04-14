@@ -1,6 +1,6 @@
-use nom::branch::alt;
 use std::str::FromStr;
 
+use nom::branch::alt;
 use nom::bytes::complete::{tag, tag_no_case};
 use nom::character::complete::{alpha1, alphanumeric1, none_of, space0};
 use nom::combinator::{map_parser, map_res, recognize};
@@ -10,6 +10,8 @@ use nom::IResult;
 
 #[derive(Debug, Clone)]
 pub struct Instruction {
+    /// set the requested tenant
+    tenant_name: String,
     /// set the requested database
     db_name: String,
     /// set sort or not
@@ -20,16 +22,23 @@ pub struct Instruction {
     user_name: String,
     /// set how long to timeout
     time_out: Option<u64>,
+
+    sleep: Option<u64>,
+
+    precision: Option<String>,
 }
 
 impl Default for Instruction {
     fn default() -> Self {
         Self {
+            tenant_name: "cnosdb".to_string(),
             db_name: "public".to_string(),
             sort: false,
             pretty: true,
-            user_name: "cnosdb".to_string(),
+            user_name: "root".to_string(),
             time_out: None,
+            sleep: None,
+            precision: None,
         }
     }
 }
@@ -72,6 +81,10 @@ fn instruction_parse_to<'a, T: FromStr>(
 }
 
 impl Instruction {
+    pub fn tenant_name(&self) -> &str {
+        &self.tenant_name
+    }
+
     pub fn db_name(&self) -> &str {
         &self.db_name
     }
@@ -92,8 +105,19 @@ impl Instruction {
         self.time_out
     }
 
+    pub fn sleep(&self) -> Option<u64> {
+        self.sleep
+    }
+
+    pub fn precision(&self) -> Option<&str> {
+        self.precision.as_deref()
+    }
     /// parse line to modify instruction
     pub fn parse_and_change(&mut self, line: &str) {
+        if let Ok((_, tenant_name)) = instruction_parse_identity("TENANT")(line) {
+            self.tenant_name = tenant_name.to_string();
+        }
+
         if let Ok((_, dbname)) = instruction_parse_identity("DATABASE")(line) {
             self.db_name = dbname.to_string();
         }
@@ -112,6 +136,14 @@ impl Instruction {
 
         if let Ok((_, timeout)) = instruction_parse_to::<u64>("TIMEOUT")(line) {
             self.time_out = Some(timeout)
+        }
+
+        if let Ok((_, slepp)) = instruction_parse_to::<u64>("SLEEP")(line) {
+            self.sleep = Some(slepp)
+        }
+
+        if let Ok((_, precision)) = instruction_parse_identity("PRECISION")(line) {
+            self.precision = Some(precision.to_string())
         }
     }
 }
@@ -165,9 +197,97 @@ impl LineProtocol {
 }
 
 #[derive(Clone, Debug)]
+pub struct OpenTSDBProtocol {
+    instruction: Instruction,
+    lines: String,
+}
+
+pub struct OpenTSDBProtocolBuild {
+    lines: String,
+}
+
+impl OpenTSDBProtocolBuild {
+    pub fn finish(self, instruction: Instruction) -> OpenTSDBProtocol {
+        OpenTSDBProtocol {
+            instruction,
+            lines: self.lines,
+        }
+    }
+
+    pub fn new() -> OpenTSDBProtocolBuild {
+        OpenTSDBProtocolBuild {
+            lines: String::new(),
+        }
+    }
+
+    pub fn push(&mut self, line: &str) {
+        self.lines.push_str(line);
+        self.lines.push('\n');
+    }
+
+    pub fn finished(&self) -> bool {
+        self.lines.is_empty()
+    }
+}
+
+impl OpenTSDBProtocol {
+    pub fn as_str(&self) -> &str {
+        self.lines.as_str()
+    }
+    pub fn instruction(&self) -> &Instruction {
+        &self.instruction
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct OpenTSDBJson {
+    instruction: Instruction,
+    lines: String,
+}
+
+pub struct OpenTSDBJsonBuild {
+    lines: String,
+}
+
+impl OpenTSDBJsonBuild {
+    pub fn finish(self, instruction: Instruction) -> OpenTSDBJson {
+        OpenTSDBJson {
+            instruction,
+            lines: self.lines,
+        }
+    }
+
+    pub fn new() -> OpenTSDBJsonBuild {
+        OpenTSDBJsonBuild {
+            lines: String::new(),
+        }
+    }
+
+    pub fn push(&mut self, line: &str) {
+        self.lines.push_str(line);
+        self.lines.push('\n');
+    }
+
+    pub fn finished(&self) -> bool {
+        self.lines.is_empty()
+    }
+}
+
+impl OpenTSDBJson {
+    pub fn as_str(&self) -> &str {
+        self.lines.as_str()
+    }
+    pub fn instruction(&self) -> &Instruction {
+        &self.instruction
+    }
+}
+
+#[derive(Clone, Debug)]
 pub enum DBRequest {
     Query(Query),
     LineProtocol(LineProtocol),
+    OpenTSDBProtocol(OpenTSDBProtocol),
+    OpenTSDBJson(OpenTSDBJson),
 }
 
 impl DBRequest {
@@ -177,8 +297,12 @@ impl DBRequest {
 
         let mut query_build = QueryBuild::new();
         let mut parsing_line_protocol = false;
+        let mut parsing_opentsdb_protocol = false;
+        let mut parsing_opentsdb_json = false;
 
         let mut line_protocol_build = LineProtocolBuild::new();
+        let mut open_tsdb_protocol_build = OpenTSDBProtocolBuild::new();
+        let mut open_tsdb_json_build = OpenTSDBJsonBuild::new();
 
         for line in lines.lines() {
             let line = line.trim();
@@ -198,6 +322,34 @@ impl DBRequest {
                 continue;
             }
 
+            if line.starts_with("--#OPENTSDB_BEGIN") {
+                parsing_opentsdb_protocol = true;
+                continue;
+            }
+
+            if line.starts_with("--#OPENTSDB_END") {
+                parsing_opentsdb_protocol = false;
+                requests.push(DBRequest::OpenTSDBProtocol(
+                    open_tsdb_protocol_build.finish(instruction.clone()),
+                ));
+                open_tsdb_protocol_build = OpenTSDBProtocolBuild::new();
+                continue;
+            }
+
+            if line.starts_with("--#OPENTSDB_JSON_BEGIN") {
+                parsing_opentsdb_json = true;
+                continue;
+            }
+
+            if line.starts_with("--#OPENTSDB_JSON_END") {
+                parsing_opentsdb_json = false;
+                requests.push(DBRequest::OpenTSDBJson(
+                    open_tsdb_json_build.finish(instruction.clone()),
+                ));
+                open_tsdb_json_build = OpenTSDBJsonBuild::new();
+                continue;
+            }
+
             if line.starts_with("--") {
                 instruction.parse_and_change(line);
                 continue;
@@ -205,6 +357,10 @@ impl DBRequest {
 
             if parsing_line_protocol {
                 line_protocol_build.push(line);
+            } else if parsing_opentsdb_protocol {
+                open_tsdb_protocol_build.push(line);
+            } else if parsing_opentsdb_json {
+                open_tsdb_json_build.push(line);
             } else {
                 query_build.push_str(line);
                 if line.ends_with(';') {
@@ -223,6 +379,17 @@ impl DBRequest {
             let line_protocol = line_protocol_build.finish(instruction.clone());
             requests.push(DBRequest::LineProtocol(line_protocol));
         }
+
+        if !open_tsdb_protocol_build.finished() {
+            let open_tsdb_protocol = open_tsdb_protocol_build.finish(instruction.clone());
+            requests.push(DBRequest::OpenTSDBProtocol(open_tsdb_protocol));
+        }
+
+        if !open_tsdb_json_build.finished() {
+            let open_tsdb_json = open_tsdb_json_build.finish(instruction.clone());
+            requests.push(DBRequest::OpenTSDBJson(open_tsdb_json));
+        }
+
         requests
     }
 }

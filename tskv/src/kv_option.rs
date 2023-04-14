@@ -1,11 +1,12 @@
 #![allow(dead_code)]
 
-use std::{path::PathBuf, sync::Arc};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use config::Config;
-use serde::{Deserialize, Serialize};
 
-use crate::{file_system, index::IndexConfig, summary};
+use crate::TseriesFamilyId;
 
 const SUMMARY_PATH: &str = "summary";
 const INDEX_PATH: &str = "index";
@@ -32,59 +33,60 @@ impl From<&Config> for Options {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub struct StorageOptions {
     pub path: PathBuf,
     pub max_summary_size: u64,
-    pub max_level: u32,
     pub base_file_size: u64,
-    pub compact_trigger: u32,
+    pub flush_req_channel_cap: usize,
+    pub max_level: u16,
+    pub compact_trigger_file_num: u32,
+    pub compact_trigger_cold_duration: Duration,
     pub max_compact_size: u64,
-    pub dio_max_resident: usize,
-    pub dio_max_non_resident: usize,
-    pub dio_page_len_scale: usize,
+    pub max_concurrent_compaction: u16,
     pub strict_write: bool,
 }
 
+// database/data/ts_family_id/tsm
+// database/data/ts_family_id/delta
+// database/data/ts_family_id/index
 impl StorageOptions {
     pub fn level_file_size(&self, lvl: u32) -> u64 {
-        self.base_file_size * lvl as u64 * self.compact_trigger as u64
+        self.base_file_size * lvl as u64 * self.compact_trigger_file_num as u64
     }
 
     pub fn summary_dir(&self) -> PathBuf {
         self.path.join(SUMMARY_PATH)
     }
 
-    pub fn index_base_dir(&self) -> PathBuf {
-        self.path.join(INDEX_PATH)
-    }
-
-    pub fn index_dir(&self, database: &str) -> PathBuf {
-        self.path.join(INDEX_PATH).join(database)
-    }
-
     pub fn database_dir(&self, database: &str) -> PathBuf {
         self.path.join(DATA_PATH).join(database)
     }
 
-    pub fn tsm_dir(&self, database: &str, ts_family_id: u32) -> PathBuf {
+    pub fn ts_family_dir(&self, database: &str, ts_family_id: TseriesFamilyId) -> PathBuf {
+        self.database_dir(database).join(ts_family_id.to_string())
+    }
+
+    pub fn index_dir(&self, database: &str, ts_family_id: TseriesFamilyId) -> PathBuf {
         self.database_dir(database)
+            .join(ts_family_id.to_string())
+            .join(INDEX_PATH)
+    }
+
+    pub fn tsm_dir(&self, database: &str, ts_family_id: TseriesFamilyId) -> PathBuf {
+        self.database_dir(database)
+            .join(ts_family_id.to_string())
             .join(TSM_PATH)
-            .join(ts_family_id.to_string())
     }
 
-    pub fn delta_dir(&self, database: &str, ts_family_id: u32) -> PathBuf {
+    pub fn delta_dir(&self, database: &str, ts_family_id: TseriesFamilyId) -> PathBuf {
         self.database_dir(database)
-            .join(DELTA_PATH)
             .join(ts_family_id.to_string())
+            .join(DELTA_PATH)
     }
 
-    pub fn direct_io_options(&self) -> file_system::Options {
-        let mut opt = file_system::Options::default();
-        opt.max_resident(self.dio_max_resident)
-            .max_non_resident(self.dio_max_non_resident)
-            .page_len_scale(self.dio_page_len_scale);
-        opt
+    pub fn tsfamily_dir(&self, database: &str, ts_family_id: TseriesFamilyId) -> PathBuf {
+        self.database_dir(database).join(ts_family_id.to_string())
     }
 }
 
@@ -93,13 +95,13 @@ impl From<&Config> for StorageOptions {
         Self {
             path: PathBuf::from(config.storage.path.clone()),
             max_summary_size: config.storage.max_summary_size,
-            max_level: config.storage.max_level,
             base_file_size: config.storage.base_file_size,
-            compact_trigger: config.storage.compact_trigger,
+            flush_req_channel_cap: config.storage.flush_req_channel_cap,
+            max_level: config.storage.max_level,
+            compact_trigger_file_num: config.storage.compact_trigger_file_num,
+            compact_trigger_cold_duration: config.storage.compact_trigger_cold_duration,
             max_compact_size: config.storage.max_compact_size,
-            dio_max_resident: config.storage.dio_max_resident,
-            dio_max_non_resident: config.storage.dio_max_non_resident,
-            dio_page_len_scale: config.storage.dio_page_len_scale,
+            max_concurrent_compaction: config.storage.max_concurrent_compaction,
             strict_write: config.storage.strict_write,
         }
     }
@@ -108,12 +110,14 @@ impl From<&Config> for StorageOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueryOptions {
     pub max_server_connections: u32,
+    pub auth_enabled: bool,
 }
 
 impl From<&Config> for QueryOptions {
     fn from(config: &Config) -> Self {
         Self {
             max_server_connections: config.query.max_server_connections,
+            auth_enabled: config.query.auth_enabled,
         }
     }
 }
@@ -122,15 +126,23 @@ impl From<&Config> for QueryOptions {
 pub struct WalOptions {
     pub enabled: bool,
     pub path: PathBuf,
+    pub wal_req_channel_cap: usize,
+    pub max_file_size: u64,
+    pub flush_trigger_total_file_size: u64,
     pub sync: bool,
+    pub sync_interval: Duration,
 }
 
 impl From<&Config> for WalOptions {
     fn from(config: &Config) -> Self {
         Self {
+            wal_req_channel_cap: config.wal.wal_req_channel_cap,
             enabled: config.wal.enabled,
             path: PathBuf::from(config.wal.path.clone()),
+            max_file_size: config.wal.max_file_size,
+            flush_trigger_total_file_size: config.wal.flush_trigger_total_file_size,
             sync: config.wal.sync,
+            sync_interval: config.wal.sync_interval,
         }
     }
 }

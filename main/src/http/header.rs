@@ -1,8 +1,8 @@
-use super::Error as HttpError;
-use spi::service::protocol::UserInfo;
+use http_protocol::header::{APPLICATION_CSV, BASIC_PREFIX};
+use models::auth::user::UserInfo;
 use warp::http::header::{HeaderName, HeaderValue};
 
-use http_protocol::header::{APPLICATION_CSV, BASIC_PREFIX};
+use super::Error as HttpError;
 
 #[derive(Debug, Clone)]
 pub struct Header {
@@ -49,6 +49,7 @@ impl Header {
                     return Ok(UserInfo {
                         user: str[0..idx].to_string(),
                         password: str[idx + 1..].to_string(),
+                        private_key: None,
                     });
                 }
             }

@@ -12,7 +12,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join("mod.rs");
     let mut generated_mod_rs_file = fs::File::create(generated_mod_rs_path)?;
     generated_mod_rs_file.write_all(
-        b"mod protobuf_generated;
+        b"#![allow(unused_imports)]
+#![allow(clippy::all)]
+mod protobuf_generated;
 pub use protobuf_generated::*;
 
 mod flatbuffers_generated;
@@ -21,11 +23,8 @@ mod flatbuffers_generated;
 
     // build .proto files
     {
-        let proto_file_paths = &[
-            proto_files_dir.join("kv_service.proto"),
-            proto_files_dir.join("schema_service.proto"),
-        ];
-        let rust_mod_names = &["kv_service".to_string(), "schema_service".to_string()];
+        let proto_file_paths = &[proto_files_dir.join("kv_service.proto")];
+        let rust_mod_names = &["kv_service".to_string()];
 
         // src/generated/protobuf_generated/
         let output_dir_final = env::current_dir()
@@ -41,6 +40,7 @@ mod flatbuffers_generated;
         tonic_build::configure()
             .out_dir(&output_dir_final)
             .file_descriptor_set_path(descriptor_set_path)
+            .protoc_arg("--experimental_allow_proto3_optional")
             .compile_well_known_types(true)
             .compile_with_config(config, proto_file_paths, &[proto_files_dir.as_path()])
             .expect("Failed to generate protobuf file {}.");
@@ -98,7 +98,17 @@ mod flatbuffers_generated;
             flatbuffers_generated_mod_rs_file.write_all(b";\n")?;
             flatbuffers_generated_mod_rs_file.flush()?;
 
-            let output = Command::new("flatc")
+            let flatc_path = match env::var("FLATC_PATH") {
+                Ok(p) => {
+                    println!(
+                        "Found specified flatc path in environment FLATC_PATH( {} )",
+                        &p
+                    );
+                    p
+                }
+                Err(_) => "flatc".to_string(),
+            };
+            let output = Command::new(&flatc_path)
                 .arg("-o")
                 .arg(&output_dir_final)
                 .arg("--rust")
@@ -109,10 +119,10 @@ mod flatbuffers_generated;
                 .arg("")
                 .arg(p)
                 .output()
-                .unwrap_or_else(|_| {
+                .unwrap_or_else(|e| {
                     panic!(
-                        "Failed to generate file by flatbuffers {}.",
-                        output_file_name
+                        "Failed to generate file '{}' by flatc(path: '{}'): {:?}.",
+                        output_file_name, flatc_path, e
                     )
                 });
 

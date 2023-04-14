@@ -1,92 +1,55 @@
-use std::{
-    cmp::Ordering,
-    sync::atomic::AtomicU64,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::sync::atomic::AtomicU64;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-const LOW_40BIT_MASK: u64 = (0x01 << 40) - 1;
-const HIGH_24BIT_MASK: u64 = ((0x01 << 24) - 1) << 40;
+const LOW_32BIT_MASK: u64 = (0x01 << 32) - 1;
+const HIGH_32BIT_MASK: u64 = ((0x01 << 32) - 1) << 32;
 
-pub fn split_id(id: u64) -> (u32, u64) {
-    (((id & HIGH_24BIT_MASK) >> 40) as u32, id & LOW_40BIT_MASK)
+pub const SECOND_NANOS: i64 = 1_000_000_000;
+pub const MINUTES_NANOS: i64 = 60 * SECOND_NANOS;
+pub const HOUR_NANOS: i64 = 60 * MINUTES_NANOS;
+pub const DAY_NANOS: i64 = 24 * HOUR_NANOS;
+
+pub const SECOND_MICROS: i64 = 1_000_000;
+pub const MINUTES_MICROS: i64 = 60 * SECOND_MICROS;
+pub const HOUR_MICROS: i64 = 60 * MINUTES_MICROS;
+pub const DAY_MICROS: i64 = 24 * HOUR_MICROS;
+
+pub const SECOND_MILLS: i64 = 1_000;
+pub const MINUTES_MILLS: i64 = 60 * SECOND_MILLS;
+pub const HOUR_MILLS: i64 = 60 * MINUTES_MILLS;
+pub const DAY_MILLS: i64 = 24 * HOUR_MILLS;
+
+pub fn split_id(id: u64) -> (u32, u32) {
+    (
+        ((id & HIGH_32BIT_MASK) >> 32) as u32,
+        (id & LOW_32BIT_MASK) as u32,
+    )
 }
 
-pub fn unite_id(hash_id: u64, incr_id: u64) -> u64 {
-    hash_id << 40 | (incr_id & LOW_40BIT_MASK)
+pub fn unite_id(hash_id: u32, incr_id: u32) -> u64 {
+    let high = (hash_id as u64) << 32;
+    let low = (incr_id & LOW_32BIT_MASK as u32) as u64;
+
+    high | low
 }
 
-pub fn and_u64(arr1: &[u64], arr2: &[u64]) -> Vec<u64> {
-    // let mut len = arr1.len();
-    // if len > arr2.len() {
-    //     len = arr2.len();
-    // }
-
-    let len = min_num(arr1.len(), arr2.len());
-
-    let mut i = 0;
-    let mut j = 0;
-    let mut result = Vec::with_capacity(len);
-
-    loop {
-        if i >= arr1.len() || j >= arr2.len() {
-            break;
-        }
-
-        match (arr1[i] & LOW_40BIT_MASK).cmp(&(arr2[j] & LOW_40BIT_MASK)) {
-            Ordering::Less => i += 1,
-            Ordering::Greater => j += 1,
-            Ordering::Equal => {
-                result.push(arr1[i]);
-                i += 1;
-                j += 1;
-            }
-        }
-    }
-
-    result
-}
-
-pub fn or_u64(arr1: &[u64], arr2: &[u64]) -> Vec<u64> {
-    let mut i = 0;
-    let mut j = 0;
-    let mut result = Vec::with_capacity(arr1.len() + arr2.len());
-
-    loop {
-        if i >= arr1.len() || j >= arr2.len() {
-            break;
-        }
-
-        match (arr1[i] & LOW_40BIT_MASK).cmp(&(arr2[j] & LOW_40BIT_MASK)) {
-            Ordering::Less => {
-                result.push(arr1[i]);
-                i += 1;
-            }
-            Ordering::Greater => {
-                result.push(arr2[j]);
-                j += 1;
-            }
-            Ordering::Equal => {
-                result.push(arr1[i]);
-                i += 1;
-                j += 1;
-            }
-        }
-    }
-
-    if i < arr1.len() {
-        result.extend_from_slice(&arr1[i..]);
-    }
-
-    if j < arr2.len() {
-        result.extend_from_slice(&arr2[j..]);
-    }
-
-    result
-}
-
-pub fn now_timestamp() -> u64 {
+pub fn now_timestamp_nanos() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(n) => n.as_millis() as u64,
+        Ok(n) => n.as_nanos() as i64,
+        Err(_) => panic!("SystemTime before UNIX EPOCH!"),
+    }
+}
+
+pub fn now_timestamp_micros() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(n) => n.as_micros() as i64,
+        Err(_) => panic!("SystemTime before UNIX EPOCH!"),
+    }
+}
+
+pub fn now_timestamp_millis() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(n) => n.as_millis() as i64,
         Err(_) => panic!("SystemTime before UNIX EPOCH!"),
     }
 }

@@ -1,18 +1,28 @@
-use std::{cmp::Ordering, hash::Hash};
+use std::cmp::Ordering;
+use std::hash::Hash;
 
-use protos::models as fb_models;
 use serde::{Deserialize, Serialize};
+use utils::BkdrHasher;
 
-use crate::{
-    errors::{Error, Result},
-    TagKey, TagValue,
-};
+use crate::errors::{Error, Result};
+use crate::{TagKey, TagValue};
 
 const TAG_KEY_MAX_LEN: usize = 512;
 const TAG_VALUE_MAX_LEN: usize = 4096;
 
 pub fn sort_tags(tags: &mut [Tag]) {
     tags.sort_by(|a, b| -> Ordering { a.key.partial_cmp(&b.key).unwrap() })
+}
+
+pub fn tags_hash_id(name: &String, tags: &[Tag]) -> u64 {
+    let mut hasher = BkdrHasher::new();
+    hasher.hash_with(name.as_bytes());
+    for tag in tags {
+        hasher.hash_with(&tag.key);
+        hasher.hash_with(&tag.value);
+    }
+
+    hasher.number()
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Hash, Clone, Eq)]
@@ -24,22 +34,6 @@ pub struct Tag {
 impl Tag {
     pub fn new(key: TagKey, value: TagValue) -> Self {
         Self { key, value }
-    }
-
-    pub fn from_flatbuffers(tag: &fb_models::Tag) -> Result<Self> {
-        let key = tag
-            .key()
-            .ok_or(Error::InvalidFlatbufferMessage {
-                err: "Tag key cannot be empty".to_string(),
-            })?
-            .to_vec();
-        let value = tag
-            .value()
-            .ok_or(Error::InvalidFlatbufferMessage {
-                err: "Tag value cannot be empty".to_string(),
-            })?
-            .to_vec();
-        Ok(Self { key, value })
     }
 
     pub fn check(&self) -> Result<()> {

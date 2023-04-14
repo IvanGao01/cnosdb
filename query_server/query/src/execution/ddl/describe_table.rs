@@ -1,17 +1,17 @@
-use crate::execution::ddl::DDLDefinitionTask;
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use datafusion::arrow::array::StringBuilder;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::catalog::TableReference;
+use meta::error::MetaError;
+use models::object_reference::ResolvedTable;
 use models::schema::TableSchema;
-use snafu::ResultExt;
-use spi::catalog::MetaDataRef;
-use spi::query::execution::ExternalSnafu;
-use spi::query::execution::MetadataSnafu;
-use spi::query::execution::{ExecutionError, Output, QueryStateMachineRef};
+use spi::query::execution::{Output, QueryStateMachineRef};
 use spi::query::logical_planner::DescribeTable;
-use std::sync::Arc;
+use spi::{QueryError, Result};
+
+use crate::execution::ddl::DDLDefinitionTask;
 
 pub struct DescribeTableTask {
     stmt: DescribeTable,
@@ -25,20 +25,29 @@ impl DescribeTableTask {
 
 #[async_trait]
 impl DDLDefinitionTask for DescribeTableTask {
-    async fn execute(
-        &self,
-        query_state_machine: QueryStateMachineRef,
-    ) -> Result<Output, ExecutionError> {
-        describe_table(
-            self.stmt.table_name.as_str(),
-            query_state_machine.catalog.clone(),
-        )
+    async fn execute(&self, query_state_machine: QueryStateMachineRef) -> Result<Output> {
+        describe_table(&self.stmt.table_name, query_state_machine).await
     }
 }
 
-fn describe_table(table_name: &str, catalog: MetaDataRef) -> Result<Output, ExecutionError> {
-    let table_name = TableReference::from(table_name);
-    let table_schema = catalog.table(table_name).context(MetadataSnafu)?;
+async fn describe_table(
+    table_name: &ResolvedTable,
+    machine: QueryStateMachineRef,
+) -> Result<Output> {
+    let tenant = table_name.tenant();
+    let client = machine
+        .meta
+        .tenant_manager()
+        .tenant_meta(tenant)
+        .await
+        .ok_or(MetaError::TenantNotFound {
+            tenant: tenant.to_string(),
+        })?;
+    let table_schema = client
+        .get_table_schema(table_name.database(), table_name.table())?
+        .ok_or(MetaError::TableNotFound {
+            table: table_name.to_string(),
+        })?;
 
     match table_schema {
         TableSchema::TsKvTableSchema(tskv_schema) => {
@@ -61,7 +70,7 @@ fn describe_table(table_name: &str, catalog: MetaDataRef) -> Result<Output, Exec
             ]));
 
             let batch = RecordBatch::try_new(
-                schema,
+                schema.clone(),
                 vec![
                     Arc::new(name.finish()),
                     Arc::new(data_type.finish()),
@@ -69,10 +78,9 @@ fn describe_table(table_name: &str, catalog: MetaDataRef) -> Result<Output, Exec
                     Arc::new(encoding.finish()),
                 ],
             )
-            .map_err(datafusion::error::DataFusionError::ArrowError)
-            .context(ExternalSnafu)?;
+            .map_err(datafusion::error::DataFusionError::ArrowError)?;
             let batches = vec![batch];
-            Ok(Output::StreamData(batches))
+            Ok(Output::StreamData(schema, batches))
         }
         TableSchema::ExternalTableSchema(external_schema) => {
             let mut name = StringBuilder::new();
@@ -86,13 +94,18 @@ fn describe_table(table_name: &str, catalog: MetaDataRef) -> Result<Output, Exec
                 Field::new("DATA_TYPE", DataType::Utf8, false),
             ]));
             let batch = RecordBatch::try_new(
-                schema,
+                schema.clone(),
                 vec![Arc::new(name.finish()), Arc::new(data_type.finish())],
             )
-            .map_err(datafusion::error::DataFusionError::ArrowError)
-            .context(ExternalSnafu)?;
+            .map_err(datafusion::error::DataFusionError::ArrowError)?;
             let batches = vec![batch];
-            Ok(Output::StreamData(batches))
+            Ok(Output::StreamData(schema, batches))
+        }
+        TableSchema::StreamTableSchema(_) => {
+            // TODO refactor: direct query information_schema
+            Err(QueryError::NotImplemented {
+                err: format!("describe stream table: {}", table_name),
+            })
         }
     }
 }

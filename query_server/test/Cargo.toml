@@ -1,7 +1,7 @@
 [package]
 name = "test"
-version = "0.1.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -9,10 +9,15 @@ edition = "2021"
 clap = { workspace = true, features = ["derive"] }
 lazy_static = { workspace = true }
 nom = { workspace = true }
-prettydiff = { workspace = true }
+diff = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 snafu = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 toml = { workspace = true }
 walkdir = { workspace = true }
+async-backtrace = { workspace = true, optional = true }
+
+[features]
+default = []
+backtrace = ["async-backtrace"]

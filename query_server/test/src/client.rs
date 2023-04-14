@@ -1,9 +1,11 @@
-use reqwest::{Method, Request};
-use reqwest::{Response, Url};
 use std::time::Duration;
+
+use reqwest::{Method, Request, Response, Url};
 use tokio::time::timeout;
 
-use crate::db_request::{DBRequest, Instruction, LineProtocol, Query};
+use crate::db_request::{
+    DBRequest, Instruction, LineProtocol, OpenTSDBJson, OpenTSDBProtocol, Query,
+};
 
 pub struct Client {
     url: Url,
@@ -35,6 +37,11 @@ impl Client {
     /// execute one sql at http://domain/query
     pub async fn execute_query(&self, query: &Query, buffer: &mut String) {
         buffer.push_str(format!("-- EXECUTE SQL: {} --\n", query.as_str()).as_str());
+        if let Some(sleep) = query.instruction().sleep() {
+            if sleep != 0 {
+                tokio::time::sleep(Duration::from_millis(sleep)).await;
+            }
+        }
         if query.instruction().sort() && query.is_return_result_set() {
             buffer.push_str("-- AFTER_SORT --\n")
         }
@@ -45,18 +52,24 @@ impl Client {
         }
         let request = request_build.unwrap();
 
-        if let Ok(resp) = self.client.execute(request).await {
-            let status_code = resp.status();
-            buffer.push_str(status_code.to_string().as_str());
-            buffer.push('\n');
-            push_query_result(buffer, query, resp).await;
-            if !status_code.is_success() {
-                push_error(buffer, "");
-            } else {
+        match self.client.execute(request).await {
+            Ok(resp) => {
+                let status_code = resp.status();
+                buffer.push_str(status_code.to_string().as_str());
                 buffer.push('\n');
+                push_query_result(buffer, query, resp).await;
+                if !status_code.is_success() {
+                    push_error(buffer, "");
+                } else {
+                    buffer.push('\n');
+                }
             }
-        } else {
-            push_error(buffer, "send error");
+            Err(e) => {
+                push_error(
+                    buffer,
+                    format!("send error ({:?}) for query ({})", e, query.as_str()).as_str(),
+                );
+            }
         }
     }
 
@@ -68,7 +81,102 @@ impl Client {
             )
             .as_str(),
         );
+        if let Some(sleep) = line_protocol.instruction().sleep() {
+            if sleep != 0 {
+                tokio::time::sleep(Duration::from_millis(sleep)).await;
+            }
+        }
         let request_build = self.build_write_request(line_protocol);
+        if request_build.is_err() {
+            push_error(buffer, "request build fail");
+            return;
+        }
+
+        let request = request_build.unwrap();
+
+        if let Ok(resp) = self.client.execute(request).await {
+            let status_code = resp.status();
+            buffer.push_str(status_code.to_string().as_str());
+            buffer.push('\n');
+            if let Ok(text) = resp.text().await {
+                if !text.is_empty() {
+                    buffer.push_str(text.as_str());
+                    buffer.push('\n');
+                }
+            }
+            if !status_code.is_success() {
+                push_error(buffer, "");
+            } else {
+                buffer.push('\n');
+            }
+        } else {
+            push_error(buffer, "");
+        }
+    }
+
+    pub async fn execute_opentsdb_write(
+        &self,
+        open_tsdb_protocol: &OpenTSDBProtocol,
+        buffer: &mut String,
+    ) {
+        buffer.push_str(
+            format!(
+                "-- WRITE OPEN TSDB PROTOCOL --\n{}-- OPEN TSDB PROTOCOL END --\n",
+                open_tsdb_protocol.as_str()
+            )
+            .as_str(),
+        );
+        if let Some(sleep) = open_tsdb_protocol.instruction().sleep() {
+            if sleep != 0 {
+                tokio::time::sleep(Duration::from_millis(sleep)).await;
+            }
+        }
+        let request_build = self.build_open_tsdb_write_request(open_tsdb_protocol);
+        if request_build.is_err() {
+            push_error(buffer, "request build fail");
+            return;
+        }
+
+        let request = request_build.unwrap();
+
+        if let Ok(resp) = self.client.execute(request).await {
+            let status_code = resp.status();
+            buffer.push_str(status_code.to_string().as_str());
+            buffer.push('\n');
+            if let Ok(text) = resp.text().await {
+                if !text.is_empty() {
+                    buffer.push_str(text.as_str());
+                    buffer.push('\n');
+                }
+            }
+            if !status_code.is_success() {
+                push_error(buffer, "");
+            } else {
+                buffer.push('\n');
+            }
+        } else {
+            push_error(buffer, "");
+        }
+    }
+
+    pub async fn execute_opentsdb_json_write(
+        &self,
+        open_tsdb_json: &OpenTSDBJson,
+        buffer: &mut String,
+    ) {
+        buffer.push_str(
+            format!(
+                "-- WRITE OPEN TSDB JSON --\n{}-- OPEN TSDB JSON END --\n",
+                open_tsdb_json.as_str()
+            )
+            .as_str(),
+        );
+        if let Some(sleep) = open_tsdb_json.instruction().sleep() {
+            if sleep != 0 {
+                tokio::time::sleep(Duration::from_millis(sleep)).await;
+            }
+        }
+        let request_build = self.build_open_tsdb_json_request(open_tsdb_json);
         if request_build.is_err() {
             push_error(buffer, "request build fail");
             return;
@@ -125,6 +233,14 @@ impl Client {
                 DBRequest::LineProtocol(line_protocol) => {
                     self.execute_write(line_protocol, &mut buffer).await;
                 }
+                DBRequest::OpenTSDBProtocol(open_tsdb_protocol) => {
+                    self.execute_opentsdb_write(open_tsdb_protocol, &mut buffer)
+                        .await;
+                }
+                DBRequest::OpenTSDBJson(open_tsdb_json) => {
+                    self.execute_opentsdb_json_write(open_tsdb_json, &mut buffer)
+                        .await;
+                }
             }
         }
         buffer
@@ -141,6 +257,12 @@ impl Client {
         } else {
             http_query.push_str(instruction.db_name());
         }
+
+        http_query.push_str("&tenant=");
+        http_query.push_str(instruction.tenant_name());
+
+        http_query.push_str("&precision=");
+        http_query.push_str(instruction.precision().unwrap_or("NS"));
 
         if instruction.pretty() {
             http_query.push_str("&pretty=true");
@@ -174,6 +296,62 @@ impl Client {
             http_query.push_str(instruction.db_name());
         }
 
+        http_query.push_str("&tenant=");
+        http_query.push_str(instruction.tenant_name());
+
+        http_query.push_str("&precision=");
+        http_query.push_str(instruction.precision().unwrap_or("NS"));
+
+        if instruction.pretty() {
+            http_query.push_str("&pretty=true");
+        }
+        url.set_query(Some(http_query.as_str()));
+        url
+    }
+
+    fn construct_opentsdb_write_url(&self, instruction: &Instruction) -> Url {
+        let mut url = self.url.join("opentsdb/write").unwrap();
+
+        let mut http_query = String::new();
+        http_query.push_str("db=");
+
+        if instruction.db_name().is_empty() {
+            http_query.push_str("public");
+        } else {
+            http_query.push_str(instruction.db_name());
+        }
+
+        http_query.push_str("&tenant=");
+        http_query.push_str(instruction.tenant_name());
+
+        http_query.push_str("&precision=");
+        http_query.push_str(instruction.precision().unwrap_or("NS"));
+
+        if instruction.pretty() {
+            http_query.push_str("&pretty=true");
+        }
+        url.set_query(Some(http_query.as_str()));
+        url
+    }
+
+    fn construct_opentsdb_json_url(&self, instruction: &Instruction) -> Url {
+        let mut url = self.url.join("opentsdb/put").unwrap();
+
+        let mut http_query = String::new();
+        http_query.push_str("db=");
+
+        if instruction.db_name().is_empty() {
+            http_query.push_str("public");
+        } else {
+            http_query.push_str(instruction.db_name());
+        }
+
+        http_query.push_str("&tenant=");
+        http_query.push_str(instruction.tenant_name());
+
+        http_query.push_str("&precision=");
+        http_query.push_str(instruction.precision().unwrap_or("NS"));
+
         if instruction.pretty() {
             http_query.push_str("&pretty=true");
         }
@@ -190,6 +368,38 @@ impl Client {
             .client
             .request(Method::POST, url)
             .basic_auth::<&str, &str>(line_protocol.instruction().user_name(), None)
+            .body(body)
+            .build()?)
+    }
+
+    fn build_open_tsdb_write_request(
+        &self,
+        open_tsdb_protocol: &OpenTSDBProtocol,
+    ) -> crate::error::Result<Request> {
+        let url = self.construct_opentsdb_write_url(open_tsdb_protocol.instruction());
+        let mut body = String::new();
+        body.push_str(open_tsdb_protocol.as_str());
+
+        Ok(self
+            .client
+            .request(Method::POST, url)
+            .basic_auth::<&str, &str>(open_tsdb_protocol.instruction().user_name(), None)
+            .body(body)
+            .build()?)
+    }
+
+    fn build_open_tsdb_json_request(
+        &self,
+        open_tsdb_protocol: &OpenTSDBJson,
+    ) -> crate::error::Result<Request> {
+        let url = self.construct_opentsdb_json_url(open_tsdb_protocol.instruction());
+        let mut body = String::new();
+        body.push_str(open_tsdb_protocol.as_str());
+
+        Ok(self
+            .client
+            .request(Method::POST, url)
+            .basic_auth::<&str, &str>(open_tsdb_protocol.instruction().user_name(), None)
             .body(body)
             .build()?)
     }

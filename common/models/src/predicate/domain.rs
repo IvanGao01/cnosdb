@@ -1,39 +1,149 @@
-use std::{
-    cmp::{self, Ordering},
-    collections::{BTreeMap, HashMap, HashSet},
-    hash::Hash,
-    ops::RangeBounds,
-    sync::Arc,
-};
+use std::cmp::{self, Ordering};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt::Display;
+use std::hash::Hash;
+use std::ops::{Bound as StdBound, RangeBounds};
+use std::sync::Arc;
 
-use crate::schema::TskvTableSchema;
-use crate::{Error, Result};
-use datafusion::{
-    arrow::datatypes::DataType, logical_expr::Expr, optimizer::utils::conjunction, prelude::Column,
-    scalar::ScalarValue,
-};
+use arrow_schema::Schema;
+use datafusion::arrow::datatypes::DataType;
+use datafusion::logical_expr::Expr;
+use datafusion::optimizer::utils::conjunction;
+use datafusion::prelude::Column;
+use datafusion::scalar::ScalarValue;
+use datafusion_proto::protobuf;
+use protos::models_helper::to_prost_bytes;
+use serde::de::Visitor;
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Serialize};
 
 use super::transformation::RowExpressionToDomainsVisitor;
+use super::Split;
+use crate::schema::{ScalarValueForkDF, TableColumn, TskvTableSchema};
+use crate::{Error, Result, Timestamp};
 
 pub type PredicateRef = Arc<Predicate>;
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TimeRange {
-    pub max_ts: i64,
     pub min_ts: i64,
+    pub max_ts: i64,
+}
+
+impl From<(StdBound<i64>, StdBound<i64>)> for TimeRange {
+    // TODO: TimeRange is a closed interval now.
+    // TODO: Using TimeRange { min_ts: Bound, max_ts: Bound }
+    fn from(range: (StdBound<i64>, StdBound<i64>)) -> Self {
+        let min_ts = match range.0 {
+            StdBound::Excluded(v) => v + 1,
+            StdBound::Included(v) => v,
+            _ => Timestamp::MIN,
+        };
+        let max_ts = match range.1 {
+            StdBound::Excluded(v) => v - 1,
+            StdBound::Included(v) => v,
+            _ => Timestamp::MAX,
+        };
+
+        TimeRange { min_ts, max_ts }
+    }
 }
 
 impl TimeRange {
-    pub fn new(max_ts: i64, min_ts: i64) -> Self {
-        Self { max_ts, min_ts }
+    pub fn new(min_ts: i64, max_ts: i64) -> Self {
+        Self { min_ts, max_ts }
     }
 
+    pub fn all() -> Self {
+        Self {
+            min_ts: Timestamp::MIN,
+            max_ts: Timestamp::MAX,
+        }
+    }
+
+    #[inline(always)]
+    pub fn is_boundless(&self) -> bool {
+        self.min_ts == Timestamp::MIN && self.max_ts == Timestamp::MAX
+    }
+
+    #[inline(always)]
     pub fn overlaps(&self, range: &TimeRange) -> bool {
         !(self.min_ts > range.max_ts || self.max_ts < range.min_ts)
     }
+
+    #[inline(always)]
+    pub fn includes(&self, other: &TimeRange) -> bool {
+        self.min_ts <= other.min_ts && self.max_ts >= other.max_ts
+    }
+
+    #[inline(always)]
+    pub fn contains(&self, time_stamp: Timestamp) -> bool {
+        time_stamp >= self.min_ts && time_stamp <= self.max_ts
+    }
+
+    pub fn intersect(&self, other: &Self) -> Option<Self> {
+        if self.overlaps(other) {
+            // There is overlap, calculate the intersection
+            let min_ts = cmp::max(self.min_ts, other.min_ts);
+            let max_ts = cmp::min(self.max_ts, other.max_ts);
+
+            return Some(Self { min_ts, max_ts });
+        }
+
+        None
+    }
+
+    pub fn total_time(&self) -> u64 {
+        if self.max_ts < self.min_ts {
+            return 0;
+        }
+        (self.max_ts as i128 - self.min_ts as i128) as u64 + 1_u64
+    }
+
+    #[inline(always)]
+    pub fn merge(&mut self, other: &TimeRange) {
+        self.min_ts = self.min_ts.min(other.min_ts);
+        self.max_ts = self.max_ts.max(other.max_ts);
+    }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+impl From<(Timestamp, Timestamp)> for TimeRange {
+    fn from(time_range: (Timestamp, Timestamp)) -> Self {
+        Self {
+            min_ts: time_range.0,
+            max_ts: time_range.1,
+        }
+    }
+}
+
+impl From<TimeRange> for (Timestamp, Timestamp) {
+    fn from(t: TimeRange) -> Self {
+        (t.min_ts, t.max_ts)
+    }
+}
+
+impl PartialOrd for TimeRange {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TimeRange {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        match self.min_ts.cmp(&other.min_ts) {
+            cmp::Ordering::Equal => self.max_ts.cmp(&other.max_ts),
+            other => other,
+        }
+    }
+}
+
+impl Display for TimeRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}, {}]", self.min_ts, self.max_ts)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 enum Bound {
     /// lower than the value, but infinitesimally close to the value.
     Below,
@@ -51,6 +161,64 @@ pub struct Marker {
     data_type: DataType,
     value: Option<ScalarValue>,
     bound: Bound,
+}
+
+impl Serialize for Marker {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let value: Option<ScalarValueForkDF> = self.value.clone().map(|e| e.into());
+
+        let mut ve = serializer.serialize_struct("Marker", 3)?;
+        ve.serialize_field("data_type", &self.data_type)?;
+        ve.serialize_field("value", &value)?;
+        ve.serialize_field("bound", &self.bound)?;
+        ve.end()
+    }
+}
+
+impl<'a> Deserialize<'a> for Marker {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'a>,
+    {
+        let mark = MarkerSerialize::deserialize(deserializer)?;
+
+        Ok(mark.into())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct MarkerSerialize {
+    data_type: DataType,
+    value: Option<ScalarValueForkDF>,
+    bound: Bound,
+}
+
+impl From<MarkerSerialize> for Marker {
+    fn from(mark: MarkerSerialize) -> Self {
+        let MarkerSerialize {
+            data_type,
+            value,
+            bound,
+        } = mark;
+        Self {
+            data_type,
+            value: value.map(|e| e.into()),
+            bound,
+        }
+    }
+}
+
+struct MarkerVisitor;
+
+impl<'de> Visitor<'de> for MarkerVisitor {
+    type Value = MarkerSerialize;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("This Visitor expects to receive Marker")
+    }
 }
 
 impl<'a> From<&'a Marker> for std::ops::Bound<&'a ScalarValue> {
@@ -195,7 +363,7 @@ impl Ord for Marker {
 }
 
 /// A Range of values across the continuous space defined by the types of the Markers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Range {
     low: Marker,
     high: Marker,
@@ -400,6 +568,43 @@ pub struct ValueEntry {
     value: ScalarValue,
 }
 
+impl Serialize for ValueEntry {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let value: protobuf::ScalarValue = (&self.value)
+            .try_into()
+            .map_err(serde::ser::Error::custom)?;
+
+        let value_buf = to_prost_bytes(value);
+
+        let mut ve = serializer.serialize_struct("ValueEntry", 2)?;
+        ve.serialize_field("data_type", &self.data_type)?;
+        ve.serialize_field("value", &value_buf)?;
+        ve.end()
+    }
+}
+
+impl<'a> Deserialize<'a> for ValueEntry {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'a>,
+    {
+        deserializer.deserialize_struct("ValueEntry", &["data_type", "value"], ValueEntryVisitor)
+    }
+}
+
+struct ValueEntryVisitor;
+
+impl<'de> Visitor<'de> for ValueEntryVisitor {
+    type Value = ValueEntry;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+        formatter.write_str("This Visitor expects to receive ValueEntry")
+    }
+}
+
 impl ValueEntry {
     pub fn value(&self) -> &ScalarValue {
         &self.value
@@ -419,7 +624,7 @@ pub fn utf8_from(val: &ScalarValue) -> Option<&str> {
 /// Ranges are coalesced into the most compact representation of non-overlapping Ranges.
 ///
 /// This structure allows iteration across these compacted Ranges in increasing order, as well as other common set-related operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RangeValueSet {
     // data_type: DataType,
     low_indexed_ranges: BTreeMap<Marker, Range>,
@@ -435,7 +640,7 @@ impl RangeValueSet {
 ///
 /// Assumes an infinite number of possible values.
 /// The values may be collectively included (aka whitelist) or collectively excluded (aka !whitelist).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EqutableValueSet {
     data_type: DataType,
     white_list: bool,
@@ -452,7 +657,7 @@ impl EqutableValueSet {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Domain {
     Range(RangeValueSet),
     Equtable(EqutableValueSet),
@@ -756,7 +961,7 @@ impl Domain {
 /// respective allowable value domain(ValueSet). Conceptually, these ValueSet can be thought of
 ///
 /// as being AND'ed together to form the representative predicate.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ColumnDomains<T>
 where
     T: Eq + Hash + Clone,
@@ -959,9 +1164,102 @@ impl Predicate {
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct QueryArgs {
+    pub vnode_ids: Vec<u32>,
+
+    pub limit: Option<usize>,
+    pub batch_size: usize,
+}
+
+impl QueryArgs {
+    pub fn encode(args: &QueryArgs) -> Result<Vec<u8>> {
+        let d = bincode::serialize(args).map_err(|err| Error::InvalidSerdeMessage {
+            err: err.to_string(),
+        })?;
+
+        Ok(d)
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<QueryArgs> {
+        let args =
+            bincode::deserialize::<QueryArgs>(buf).map_err(|err| Error::InvalidSerdeMessage {
+                err: err.to_string(),
+            })?;
+
+        Ok(args)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryExpr {
+    pub split: Split,
+    pub df_schema: Schema,
+    pub table_schema: TskvTableSchema,
+}
+
+impl QueryExpr {
+    pub fn encode(option: &QueryExpr) -> Result<Vec<u8>> {
+        let bytes = bincode::serialize(option).map_err(|e| Error::InvalidQueryExprMsg {
+            err: format!("encode error {}", e),
+        })?;
+
+        Ok(bytes)
+    }
+
+    pub fn decode(buf: &[u8]) -> Result<QueryExpr> {
+        bincode::deserialize::<QueryExpr>(buf).map_err(|e| Error::InvalidQueryExprMsg {
+            err: format!("decode error {}", e),
+        })
+    }
+}
+
+pub fn encode_agg(agg: &Option<Vec<TableColumn>>) -> Result<Vec<u8>> {
+    let d = bincode::serialize(agg).map_err(|err| Error::InvalidSerdeMessage {
+        err: err.to_string(),
+    })?;
+
+    Ok(d)
+}
+
+pub fn decode_agg(buf: &[u8]) -> Result<Option<Vec<TableColumn>>> {
+    let args = bincode::deserialize::<Option<Vec<TableColumn>>>(buf).map_err(|err| {
+        Error::InvalidSerdeMessage {
+            err: err.to_string(),
+        }
+    })?;
+
+    Ok(args)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PushedAggregateFunction {
+    Count(String),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_shchema_encode_decode() {
+        use std::collections::HashMap;
+
+        use arrow_schema::*;
+
+        let field_a = Field::new("a", DataType::Int64, false);
+        let field_b = Field::new("b", DataType::Boolean, false);
+
+        let mut metadata: HashMap<String, String> = HashMap::new();
+        metadata.insert("row_count".to_string(), "100".to_string());
+
+        let schema = Arc::new(Schema::new_with_metadata(vec![field_a, field_b], metadata));
+
+        let buffer = serde_json::to_string(&schema.as_ref()).unwrap();
+        let df_schema = serde_json::from_str::<Schema>(&buffer).unwrap();
+
+        assert_eq!(schema.as_ref(), &df_schema);
+    }
 
     #[test]
     fn test_of_ranges() {

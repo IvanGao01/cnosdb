@@ -1,21 +1,21 @@
-use super::Error as HttpError;
+use std::str::FromStr;
+
 use datafusion::arrow::csv::writer::WriterBuilder;
 use datafusion::arrow::error::Result as ArrowResult;
 use datafusion::arrow::json::{ArrayWriter, LineDelimitedWriter};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::pretty::pretty_format_batches;
-use spi::query::execution::Output;
-use spi::service::protocol::QueryHandle;
-use std::str::FromStr;
-use warp::reply::Response;
-
-use crate::http::response::ResponseBuilder;
-
 use http_protocol::header::{
     APPLICATION_CSV, APPLICATION_JSON, APPLICATION_NDJSON, APPLICATION_PREFIX, APPLICATION_STAR,
     APPLICATION_TABLE, APPLICATION_TSV, CONTENT_TYPE, STAR_STAR,
 };
 use http_protocol::status_code::OK;
+use warp::reply::Response;
+use warp::{reject, Rejection};
+
+use super::Error as HttpError;
+use crate::http::header::Header;
+use crate::http::response::ResponseBuilder;
 
 macro_rules! batches_to_json {
     ($WRITER: ident, $batches: expr) => {{
@@ -44,7 +44,7 @@ fn batches_with_sep(batches: &[RecordBatch], delimiter: u8) -> ArrowResult<Vec<u
 }
 
 /// Allow records to be printed in different formats
-#[derive(Debug, PartialEq, Eq, clap::ArgEnum, Clone)]
+#[derive(Debug, PartialEq, Eq, clap::ValueEnum, Clone)]
 pub enum ResultFormat {
     Csv,
     Tsv,
@@ -117,36 +117,23 @@ impl FromStr for ResultFormat {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        clap::ArgEnum::from_str(s, true)
+        clap::ValueEnum::from_str(s, true)
     }
 }
 
-pub async fn fetch_record_batches(res: &mut QueryHandle) -> ArrowResult<Vec<RecordBatch>> {
-    let mut actual = vec![];
-
-    trace::trace!("try collect result for: {}", res.query().content());
-
-    for ele in res.result().iter_mut() {
-        match ele {
-            Output::StreamData(stream) => {
-                actual.append(stream);
-            }
-            Output::Nil(_) => {}
-        }
-    }
-
-    trace::trace!("successfully collected result of {}", res.query().content());
-
-    Ok(actual)
+pub fn get_result_format_from_header(header: &Header) -> Result<ResultFormat, Rejection> {
+    ResultFormat::try_from(header.get_accept()).map_err(reject::custom)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::Arc;
+
     use datafusion::arrow::array::Int32Array;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::from_slice::FromSlice;
-    use std::sync::Arc;
+
+    use super::*;
 
     #[test]
     fn test_format_batches_with_sep() {

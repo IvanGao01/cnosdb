@@ -1,14 +1,14 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use datafusion::{
-    datasource::source_as_provider,
-    logical_expr::{Extension, LogicalPlan, LogicalPlanBuilder, TableScan},
-    optimizer::{OptimizerConfig, OptimizerRule},
-};
-
-use crate::{extension::logical::plan_node::tag_scan::TagScanPlanNode, table::ClusterTable};
-
+use datafusion::common::{DFField, DFSchema};
+use datafusion::datasource::source_as_provider;
 use datafusion::error::Result;
+use datafusion::logical_expr::{Extension, LogicalPlan, LogicalPlanBuilder, TableScan};
+use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
+
+use crate::data_source::batch::tskv::ClusterTable;
+use crate::extension::logical::plan_node::tag_scan::TagScanPlanNode;
 
 /// Convert query statement to query tag operation
 ///
@@ -17,11 +17,11 @@ use datafusion::error::Result;
 pub struct RewriteTagScan {}
 
 impl OptimizerRule for RewriteTagScan {
-    fn optimize(
+    fn try_optimize(
         &self,
         plan: &LogicalPlan,
-        optimizer_config: &mut OptimizerConfig,
-    ) -> Result<LogicalPlan> {
+        optimizer_config: &dyn OptimizerConfig,
+    ) -> Result<Option<LogicalPlan>> {
         if let LogicalPlan::TableScan(TableScan {
             table_name,
             source,
@@ -29,24 +29,70 @@ impl OptimizerRule for RewriteTagScan {
             projected_schema,
             filters,
             fetch,
+            agg_with_grouping,
         }) = plan
         {
             if let Some(cluster_table) = source_as_provider(source)?
                 .as_any()
                 .downcast_ref::<ClusterTable>()
             {
+                let table_schema = cluster_table.table_schema();
                 // Only handle the table of ClusterTable
                 if let Some(e) = projection.as_ref() {
-                    // Find non-tag columns from projection
-                    let non_tag_column = e.iter().find(|idx| {
-                        if let Some(c) = cluster_table.table_schema().column_by_index(**idx) {
-                            !c.column_type.is_tag()
-                        } else {
-                            false
-                        }
-                    });
+                    let mut contain_time = false;
+                    let mut contain_tag = false;
+                    let mut contain_field = false;
 
-                    if non_tag_column.is_none() {
+                    // Find non-tag columns from projection
+                    e.iter()
+                        .flat_map(|i| table_schema.column_by_index(*i))
+                        .for_each(|c| {
+                            if c.column_type.is_tag() {
+                                contain_tag = true;
+                            } else if c.column_type.is_field() {
+                                contain_field = true;
+                            } else if c.column_type.is_time() {
+                                contain_time = true;
+                            }
+                        });
+
+                    if contain_time && !contain_field {
+                        let new_projection = e
+                            .iter()
+                            .cloned()
+                            .chain(
+                                cluster_table
+                                    .table_schema()
+                                    .columns()
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, c)| c.column_type.is_field())
+                                    .map(|(i, _)| i),
+                            )
+                            .collect::<Vec<usize>>();
+
+                        let new_df_schema = DFSchema::new_with_metadata(
+                            new_projection
+                                .iter()
+                                .flat_map(|i| table_schema.column_by_index(*i))
+                                .map(|c| DFField::from_qualified(table_name, c.to_arrow_field()))
+                                .collect(),
+                            HashMap::new(),
+                        )?;
+
+                        let new_table_scan = LogicalPlan::TableScan(TableScan {
+                            table_name: table_name.clone(),
+                            source: source.clone(),
+                            projection: Some(new_projection),
+                            projected_schema: Arc::new(new_df_schema),
+                            filters: filters.clone(),
+                            fetch: *fetch,
+                            agg_with_grouping: agg_with_grouping.clone(),
+                        });
+                        return Ok(Some(LogicalPlanBuilder::from(new_table_scan).build()?));
+                    }
+
+                    if contain_tag && !contain_field && !contain_time {
                         // If it does not contain non-tag columns, convert TableScan to TagScan
                         let tag_plan = LogicalPlan::Extension(Extension {
                             node: Arc::new(TagScanPlanNode {
@@ -59,7 +105,9 @@ impl OptimizerRule for RewriteTagScan {
                             }),
                         });
                         // The result of tag scan needs to be deduplicated
-                        return LogicalPlanBuilder::from(tag_plan).distinct()?.build();
+                        return Ok(Some(
+                            LogicalPlanBuilder::from(tag_plan).distinct()?.build()?,
+                        ));
                     }
                 }
             }

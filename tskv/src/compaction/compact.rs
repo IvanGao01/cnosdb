@@ -1,33 +1,22 @@
-use std::{
-    collections::{BinaryHeap, HashMap, VecDeque},
-    iter::Peekable,
-    marker::PhantomData,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::pin::Pin;
+use std::sync::Arc;
 
-use evmap::new;
-use models::{FieldId, Timestamp, ValueType};
+use models::{FieldId, Timestamp};
 use snafu::ResultExt;
-use trace::{debug, error, info, trace};
+use trace::{error, info, trace};
+use utils::BloomFilter;
 
-use crate::file_system::file_manager::{self, get_file_manager};
-use crate::{
-    compaction::CompactReq,
-    context::GlobalContext,
-    error::{self, Result},
-    file_system::DmaFile,
-    file_utils,
-    kv_option::Options,
-    memcache::DataType,
-    summary::{CompactMeta, VersionEdit},
-    tseries_family::{ColumnFile, TimeRange},
-    tsm::{
-        self, BlockMeta, BlockMetaIterator, ColumnReader, DataBlock, Index, IndexIterator,
-        IndexMeta, IndexReader, TsmReader, TsmWriter,
-    },
-    Error, LevelId,
+use super::iterator::BufferedIterator;
+use crate::compaction::CompactReq;
+use crate::context::GlobalContext;
+use crate::error::{self, Result};
+use crate::summary::{CompactMeta, VersionEdit};
+use crate::tseries_family::TseriesFamily;
+use crate::tsm::{
+    self, BlockMeta, BlockMetaIterator, DataBlock, IndexIterator, IndexMeta, TsmReader, TsmWriter,
 };
+use crate::{ColumnFileId, LevelId, TseriesFamilyId};
 
 /// Temporary compacting data block meta
 struct CompactingBlockMeta {
@@ -70,7 +59,7 @@ impl CompactingBlockMeta {
 /// - priority: When merging two (timestamp, value) pair with the same
 /// timestamp from two data blocks, pair from data block with lower
 /// priority will be discarded.
-enum CompactingBlock {
+pub(crate) enum CompactingBlock {
     DataBlock {
         priority: usize,
         field_id: FieldId,
@@ -114,10 +103,65 @@ impl CompactingBlock {
     }
 }
 
-struct CompactIterator {
-    tsm_readers: Vec<TsmReader>,
+struct CompactingFile {
+    i: usize,
+    tsm_reader: Arc<TsmReader>,
+    index_iter: BufferedIterator<IndexIterator>,
+    field_id: Option<FieldId>,
+}
 
-    tsm_index_iters: Vec<Peekable<IndexIterator>>,
+impl CompactingFile {
+    fn new(i: usize, tsm_reader: Arc<TsmReader>) -> Self {
+        let mut index_iter = BufferedIterator::new(tsm_reader.index_iterator());
+        let first_field_id = index_iter.peek().map(|i| i.field_id());
+        Self {
+            i,
+            tsm_reader,
+            index_iter,
+            field_id: first_field_id,
+        }
+    }
+
+    fn next(&mut self) -> Option<&IndexMeta> {
+        let idx_meta = self.index_iter.next();
+        idx_meta.map(|i| self.field_id.replace(i.field_id()));
+        idx_meta
+    }
+
+    fn peek(&mut self) -> Option<&IndexMeta> {
+        self.index_iter.peek()
+    }
+}
+
+impl Eq for CompactingFile {}
+
+impl PartialEq for CompactingFile {
+    fn eq(&self, other: &Self) -> bool {
+        self.tsm_reader.file_id() == other.tsm_reader.file_id() && self.field_id == other.field_id
+    }
+}
+
+impl Ord for CompactingFile {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.partial_cmp(other).unwrap()
+    }
+}
+
+impl PartialOrd for CompactingFile {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.field_id.cmp(&other.field_id).reverse())
+    }
+}
+
+pub(crate) struct CompactIterator {
+    tsm_readers: Vec<Arc<TsmReader>>,
+    compacting_files: BinaryHeap<Pin<Box<CompactingFile>>>,
+    /// Maximum values in generated CompactingBlock
+    max_datablock_values: u32,
+    /// Decode a data block even though it doesn't need to merge with others,
+    /// return CompactingBlock::DataBlock rather than CompactingBlock::Raw
+    decode_non_overlap_blocks: bool,
+
     tmp_tsm_blks: Vec<BlockMetaIterator>,
     /// Index to mark `Peekable<BlockMetaIterator>` in witch `TsmReader`,
     /// tmp_tsm_blks[i] is in self.tsm_readers[ tmp_tsm_blk_tsm_reader_idx[i] ]
@@ -127,11 +171,8 @@ struct CompactIterator {
     /// How many finished_idxes is set to true
     finished_reader_cnt: usize,
     curr_fid: Option<FieldId>,
-    last_fid: Option<FieldId>,
 
     merged_blocks: VecDeque<CompactingBlock>,
-
-    max_datablock_values: u32,
 }
 
 /// To reduce construction code
@@ -139,67 +180,85 @@ impl Default for CompactIterator {
     fn default() -> Self {
         Self {
             tsm_readers: Default::default(),
-            tsm_index_iters: Default::default(),
+            compacting_files: Default::default(),
+            max_datablock_values: 0,
+            decode_non_overlap_blocks: false,
             tmp_tsm_blks: Default::default(),
             tmp_tsm_blk_tsm_reader_idx: Default::default(),
             finished_readers: Default::default(),
             finished_reader_cnt: Default::default(),
             curr_fid: Default::default(),
-            last_fid: Default::default(),
             merged_blocks: Default::default(),
-            max_datablock_values: Default::default(),
         }
     }
 }
 
 impl CompactIterator {
+    pub(crate) fn new(
+        tsm_readers: Vec<Arc<TsmReader>>,
+        max_data_block_size: u32,
+        decode_non_overlap_blocks: bool,
+    ) -> Self {
+        let compacting_files: BinaryHeap<Pin<Box<CompactingFile>>> = tsm_readers
+            .iter()
+            .enumerate()
+            .map(|(i, r)| Box::pin(CompactingFile::new(i, r.clone())))
+            .collect();
+        let compacting_files_cnt = compacting_files.len();
+
+        Self {
+            tsm_readers,
+            compacting_files,
+            max_datablock_values: max_data_block_size,
+            decode_non_overlap_blocks,
+            finished_readers: vec![false; compacting_files_cnt],
+            ..Default::default()
+        }
+    }
+
     /// Update tmp_tsm_blks and tmp_tsm_blk_tsm_reader_idx for field id in next iteration.
     fn next_field_id(&mut self) {
-        self.tmp_tsm_blks = Vec::with_capacity(self.tsm_index_iters.len());
-        self.tmp_tsm_blk_tsm_reader_idx = Vec::with_capacity(self.tsm_index_iters.len());
-        for (next_tsm_file_idx, (i, idx)) in self.tsm_index_iters.iter_mut().enumerate().enumerate()
-        {
-            if self.finished_readers[i] {
-                trace!("file no.{} has been finished, continue.", i);
-                continue;
+        self.curr_fid = None;
+
+        if let Some(f) = self.compacting_files.peek() {
+            if self.curr_fid.is_none() {
+                self.curr_fid = f.field_id
             }
-            if let Some(idx_meta) = idx.peek() {
-                // Get field id from first block for this iteration
-                if let Some(fid) = self.curr_fid {
-                    // This is the idx of the next field_id.
-                    if fid != idx_meta.field_id() {
-                        continue;
-                    }
+        } else {
+            // TODO finished
+            self.finished_reader_cnt += 1;
+        }
+        while let Some(mut f) = self.compacting_files.pop() {
+            let loop_field_id = f.field_id;
+            let loop_file_i = f.i;
+            if self.curr_fid == loop_field_id {
+                if let Some(idx_meta) = f.peek() {
+                    self.tmp_tsm_blks.push(idx_meta.block_iterator());
+                    self.tmp_tsm_blk_tsm_reader_idx.push(loop_file_i);
+                    trace!("merging idx_meta: field_id: {}, field_type: {:?}, block_count: {}, time_range: {:?}",
+                        idx_meta.field_id(),
+                        idx_meta.field_type(),
+                        idx_meta.block_count(),
+                        idx_meta.time_range()
+                    );
+                    f.next();
+                    self.compacting_files.push(f);
                 } else {
-                    // This is the first idx.
-                    self.curr_fid = Some(idx_meta.field_id());
-                    self.last_fid = Some(idx_meta.field_id());
+                    // This tsm-file has been finished
+                    trace!("file {} is finished.", loop_file_i);
+                    self.finished_readers[loop_file_i] = true;
+                    self.finished_reader_cnt += 1;
                 }
-
-                let blk_cnt = idx_meta.block_count();
-
-                self.tmp_tsm_blks.push(idx_meta.block_iterator());
-                self.tmp_tsm_blk_tsm_reader_idx.push(next_tsm_file_idx);
-                trace!("merging idx_meta: field_id: {}, field_type: {:?}, block_count: {}, time_range: {:?}",
-                      idx_meta.field_id(),
-                      idx_meta.field_type(),
-                      idx_meta.block_count(),
-                      idx_meta.time_range());
             } else {
-                // This tsm-file has been finished
-                trace!("file no.{} is finished.", i);
-                self.finished_readers[i] = true;
-                self.finished_reader_cnt += 1;
+                self.compacting_files.push(f);
+                break;
             }
-
-            // To next field
-            idx.next();
         }
     }
 
     /// Collect merging `DataBlock`s.
-    fn next_merging_blocks(&mut self) -> Result<()> {
-        if self.tmp_tsm_blks.is_empty() {
+    async fn next_merging_blocks(&mut self) -> Result<()> {
+        if self.curr_fid.is_none() || self.tmp_tsm_blks.is_empty() {
             return Ok(());
         }
         let mut sorted_blk_metas: BinaryHeap<CompactingBlockMeta> =
@@ -250,9 +309,10 @@ impl CompactIterator {
                 if cbm.block_meta.size() as usize > buf.len() {
                     buf.resize(cbm.block_meta.size() as usize, 0);
                 }
-                if cbm.has_tombstone {
+                if cbm.has_tombstone || self.decode_non_overlap_blocks {
                     let data_block = self.tsm_readers[cbm.readers_idx]
                         .get_data_block(&cbm.block_meta)
+                        .await
                         .context(error::ReadTsmSnafu)?;
                     merging_blks.push(CompactingBlock::DataBlock {
                         priority: cbm.readers_idx + 1,
@@ -262,6 +322,7 @@ impl CompactIterator {
                 } else {
                     let size = self.tsm_readers[cbm.readers_idx]
                         .get_raw_data(&cbm.block_meta, &mut buf)
+                        .await
                         .context(error::ReadTsmSnafu)?;
                     merging_blks.push(CompactingBlock::Raw {
                         priority: cbm.readers_idx + 1,
@@ -276,6 +337,7 @@ impl CompactIterator {
                 // 2.1
                 let data_block = self.tsm_readers[cbm.readers_idx]
                     .get_data_block(&cbm.block_meta)
+                    .await
                     .context(error::ReadTsmSnafu)?;
                 merging_blks.push(CompactingBlock::DataBlock {
                     priority: cbm.readers_idx + 1,
@@ -290,7 +352,7 @@ impl CompactIterator {
                 if !merging_blks.is_empty() {
                     if merging_blks.len() == 1 {
                         // 2.2.1
-                        if let Some(CompactingBlock::Raw { meta, raw, .. }) = merging_blks.first() {
+                        if let Some(CompactingBlock::Raw { meta, .. }) = merging_blks.first() {
                             if meta.count() == self.max_datablock_values {
                                 self.merged_blocks.push_back(merging_blks.remove(0));
                             }
@@ -302,7 +364,7 @@ impl CompactIterator {
                         let merged_data_blks =
                             DataBlock::merge_blocks(merging_data_blks, self.max_datablock_values);
 
-                        for (i, data_block) in merged_data_blks.into_iter().enumerate() {
+                        for (_i, data_block) in merged_data_blks.into_iter().enumerate() {
                             if data_block.len() < self.max_datablock_values as usize {
                                 merging_blks.push(CompactingBlock::DataBlock {
                                     priority: 0,
@@ -329,9 +391,10 @@ impl CompactIterator {
                             merged_blk_time_range.0.min(cbm.block_meta.min_ts());
                         merged_blk_time_range.1 =
                             merged_blk_time_range.0.max(cbm.block_meta.max_ts());
-                        if cbm.has_tombstone {
+                        if cbm.has_tombstone || self.decode_non_overlap_blocks {
                             let data_block = self.tsm_readers[cbm.readers_idx]
                                 .get_data_block(&cbm.block_meta)
+                                .await
                                 .context(error::ReadTsmSnafu)?;
                             merging_blks.push(CompactingBlock::DataBlock {
                                 priority: cbm.readers_idx + 1,
@@ -341,6 +404,7 @@ impl CompactIterator {
                         } else {
                             let size = self.tsm_readers[cbm.readers_idx]
                                 .get_raw_data(&cbm.block_meta, &mut buf)
+                                .await
                                 .context(error::ReadTsmSnafu)?;
                             merging_blks.push(CompactingBlock::Raw {
                                 priority: cbm.readers_idx + 1,
@@ -352,6 +416,7 @@ impl CompactIterator {
                         // cbm.block_meta.count is less than max_datablock_values
                         let data_block = self.tsm_readers[cbm.readers_idx]
                             .get_data_block(&cbm.block_meta)
+                            .await
                             .context(error::ReadTsmSnafu)?;
                         merging_blks.push(CompactingBlock::DataBlock {
                             priority: cbm.readers_idx + 1,
@@ -368,7 +433,7 @@ impl CompactIterator {
             let merged_data_blks =
                 DataBlock::merge_blocks(merging_data_blks, self.max_datablock_values);
 
-            for (i, data_block) in merged_data_blks.into_iter().enumerate() {
+            for (_i, data_block) in merged_data_blks.into_iter().enumerate() {
                 self.merged_blocks.push_back(CompactingBlock::DataBlock {
                     priority: 0,
                     field_id,
@@ -381,10 +446,8 @@ impl CompactIterator {
     }
 }
 
-impl Iterator for CompactIterator {
-    type Item = Result<CompactingBlock>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+impl CompactIterator {
+    pub(crate) async fn next(&mut self) -> Option<Result<CompactingBlock>> {
         if let Some(blk) = self.merged_blocks.pop_front() {
             return Some(Ok(blk));
         }
@@ -405,7 +468,7 @@ impl Iterator for CompactIterator {
             }
 
             // Get all of block_metas of this field id, and merge these blocks
-            if let Err(e) = self.next_merging_blocks() {
+            if let Err(e) = self.next_merging_blocks().await {
                 return Some(Err(e));
             }
 
@@ -422,14 +485,14 @@ impl Iterator for CompactIterator {
 }
 
 /// Returns if r1 (min_ts, max_ts) overlaps r2 (min_ts, max_ts)
-pub fn overlaps_tuples(r1: (i64, i64), r2: (i64, i64)) -> bool {
+fn overlaps_tuples(r1: (i64, i64), r2: (i64, i64)) -> bool {
     r1.0 <= r2.1 && r1.1 >= r2.0
 }
 
-pub fn run_compaction_job(
+pub async fn run_compaction_job(
     request: CompactReq,
     kernel: Arc<GlobalContext>,
-) -> Result<Option<VersionEdit>> {
+) -> Result<Option<(VersionEdit, HashMap<ColumnFileId, Arc<BloomFilter>>)>> {
     info!(
         "Compaction: Running compaction job on ts_family: {} and files: [ {} ]",
         request.ts_family_id,
@@ -449,77 +512,72 @@ pub fn run_compaction_job(
             .join(", ")
     );
 
-    let version = request.version;
-
-    // Buffers all tsm-files and it's indexes for this compaction
-    let max_data_block_size = 1000; // TODO this const value is in module tsm
-    let tsf_id = request.ts_family_id;
-    let storage_opt = request.storage_opt;
-    let mut tsm_files: Vec<PathBuf> = Vec::new();
-    let mut tsm_readers = Vec::new();
-    let mut tsm_index_iters = Vec::new();
-    for col_file in request.files.iter() {
-        let tsm_file = col_file.file_path();
-        let tsm_reader = TsmReader::open(&tsm_file)?;
-        tsm_files.push(tsm_file);
-        let idx_iter = tsm_reader.index_iterator().peekable();
-        tsm_readers.push(tsm_reader);
-        tsm_index_iters.push(idx_iter);
-    }
-
-    if tsm_index_iters.is_empty() {
+    if request.files.is_empty() {
         // Nothing to compact
         return Ok(None);
     }
 
-    let tsm_readers_cnt = tsm_readers.len();
-    let iter = CompactIterator {
-        tsm_readers,
-        tsm_index_iters,
-        finished_readers: vec![false; tsm_readers_cnt],
-        max_datablock_values: max_data_block_size,
-        ..Default::default()
-    };
+    let version = request.version;
+
+    // Buffers all tsm-files and it's indexes for this compaction
+    let max_data_block_size = TseriesFamily::MAX_DATA_BLOCK_SIZE;
+    let tsf_id = request.ts_family_id;
+    let storage_opt = request.storage_opt;
+    let mut tsm_readers = Vec::new();
+    for col_file in request.files.iter() {
+        let tsm_file = col_file.file_path();
+        // TODO Get tsm reader from lru cache.
+        let tsm_reader = version.get_tsm_reader(&tsm_file).await?;
+        tsm_readers.push(tsm_reader);
+    }
+
+    let mut iter = CompactIterator::new(tsm_readers, max_data_block_size, false);
     let tsm_dir = storage_opt.tsm_dir(&request.database, tsf_id);
-    let mut tsm_writer = tsm::new_tsm_writer(&tsm_dir, kernel.file_id_next(), false, 0)?;
+    let mut tsm_writer = tsm::new_tsm_writer(&tsm_dir, kernel.file_id_next(), false, 0).await?;
     info!("Compaction: File {} been created.", tsm_writer.sequence());
-    let mut version_edit = VersionEdit::new();
-    version_edit.tsf_id = tsf_id;
-    for next_blk in iter.flatten() {
+    let mut version_edit = VersionEdit::new(tsf_id);
+    let mut file_metas: HashMap<ColumnFileId, Arc<BloomFilter>> = HashMap::new();
+
+    while let Some(block) = iter.next().await {
+        let blk = block?;
         trace!("===============================");
-        let write_ret = match next_blk {
+        let write_ret = match blk {
             CompactingBlock::DataBlock {
                 field_id: fid,
                 data_block: b,
                 ..
             } => {
                 // TODO: let enc = b.encodings();
-                tsm_writer.write_block(fid, &b)
+                tsm_writer.write_block(fid, &b).await
             }
-            CompactingBlock::Raw { meta, raw, .. } => tsm_writer.write_raw(&meta, &raw),
+            CompactingBlock::Raw { meta, raw, .. } => tsm_writer.write_raw(&meta, &raw).await,
         };
         if let Err(e) = write_ret {
             match e {
                 tsm::WriteTsmError::IO { source } => {
-                    // TODO handle this
-                    error!("IO error when write tsm");
+                    // TODO handle this: stop compaction and report an error.
+                    error!("IO error when write tsm: {:?}", source);
                 }
                 tsm::WriteTsmError::Encode { source } => {
-                    // TODO handle this
-                    error!("Encoding error when write tsm");
+                    // TODO handle this: stop compaction and report an error.
+                    error!("Encoding error when write tsm: {:?}", source);
                 }
-                tsm::WriteTsmError::MaxFileSizeExceed { source } => {
-                    tsm_writer.write_index().context(error::WriteTsmSnafu)?;
-                    tsm_writer.finish().context(error::WriteTsmSnafu)?;
+                tsm::WriteTsmError::MaxFileSizeExceed { .. } => {
+                    tsm_writer
+                        .write_index()
+                        .await
+                        .context(error::WriteTsmSnafu)?;
+                    tsm_writer.finish().await.context(error::WriteTsmSnafu)?;
                     info!(
                         "Compaction: File: {} write finished (level: {}, {} B).",
                         tsm_writer.sequence(),
                         request.out_level,
                         tsm_writer.size()
                     );
-                    let cm = new_compact_meta(&tsm_writer, request.out_level);
+                    let cm = new_compact_meta(&tsm_writer, request.ts_family_id, request.out_level);
                     version_edit.add_file(cm, version.max_level_ts);
-                    tsm_writer = tsm::new_tsm_writer(&tsm_dir, kernel.file_id_next(), false, 0)?;
+                    tsm_writer =
+                        tsm::new_tsm_writer(&tsm_dir, kernel.file_id_next(), false, 0).await?;
                     info!("Compaction: File {} been created.", tsm_writer.sequence());
                 }
                 tsm::WriteTsmError::Finished { path } => {
@@ -529,16 +587,23 @@ pub fn run_compaction_job(
         }
     }
 
-    tsm_writer.write_index().context(error::WriteTsmSnafu)?;
-    tsm_writer.finish().context(error::WriteTsmSnafu)?;
+    tsm_writer
+        .write_index()
+        .await
+        .context(error::WriteTsmSnafu)?;
+    tsm_writer.finish().await.context(error::WriteTsmSnafu)?;
     info!(
         "Compaction: File: {} write finished (level: {}, {} B).",
         tsm_writer.sequence(),
         request.out_level,
         tsm_writer.size()
     );
-    let cm = new_compact_meta(&tsm_writer, request.out_level);
+    let cm = new_compact_meta(&tsm_writer, request.ts_family_id, request.out_level);
     version_edit.add_file(cm, version.max_level_ts);
+    file_metas.insert(
+        tsm_writer.sequence(),
+        Arc::new(tsm_writer.bloom_filter_cloned()),
+    );
     for file in request.files {
         version_edit.del_file(file.level(), file.file_id(), file.is_delta());
     }
@@ -548,57 +613,54 @@ pub fn run_compaction_job(
         version_edit
     );
 
-    Ok(Some(version_edit))
+    Ok(Some((version_edit, file_metas)))
 }
 
-fn new_compact_meta(tsm_writer: &TsmWriter, level: LevelId) -> CompactMeta {
+fn new_compact_meta(
+    tsm_writer: &TsmWriter,
+    tsf_id: TseriesFamilyId,
+    level: LevelId,
+) -> CompactMeta {
     CompactMeta {
         file_id: tsm_writer.sequence(),
         file_size: tsm_writer.size(),
+        tsf_id,
         level,
         min_ts: tsm_writer.min_ts(),
         max_ts: tsm_writer.max_ts(),
         high_seq: 0,
         low_seq: 0,
         is_delta: false,
-        ..Default::default()
     }
 }
 
 #[cfg(test)]
-mod test {
+pub mod test {
     use core::panic;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+
+    use lru_cache::asynchronous::ShardedCache;
     use minivec::MiniVec;
-    use std::{
-        collections::HashMap,
-        default,
-        path::{Path, PathBuf},
-        sync::{
-            atomic::{AtomicBool, AtomicU32, AtomicU64},
-            Arc,
-        },
-    };
-
+    use models::predicate::domain::TimeRange;
     use models::{FieldId, Timestamp, ValueType};
-    use utils::BloomFilter;
 
+    use crate::compaction::{run_compaction_job, CompactReq};
+    use crate::context::GlobalContext;
     use crate::file_system::file_manager;
-    use crate::{
-        compaction::{run_compaction_job, CompactReq},
-        context::GlobalContext,
-        file_utils,
-        kv_option::Options,
-        summary::VersionEdit,
-        tseries_family::{ColumnFile, LevelInfo, TimeRange, Version},
-        tsm::{self, codec::DataBlockEncoding, DataBlock, Tombstone, TsmReader, TsmTombstone},
-        TseriesFamilyId,
-    };
+    use crate::kv_option::Options;
+    use crate::summary::VersionEdit;
+    use crate::tseries_family::{ColumnFile, LevelInfo, Version};
+    use crate::tsm::codec::DataBlockEncoding;
+    use crate::tsm::{self, DataBlock, TsmReader, TsmTombstone};
+    use crate::{file_utils, TseriesFamilyId};
 
-    fn write_data_blocks_to_column_file(
+    pub(crate) async fn write_data_blocks_to_column_file(
         dir: impl AsRef<Path>,
         data: Vec<HashMap<FieldId, Vec<DataBlock>>>,
-        tsf_id: TseriesFamilyId,
-        tsf_opt: Arc<Options>,
+        _tsf_id: TseriesFamilyId,
+        _tsf_opt: Arc<Options>,
     ) -> (u64, Vec<Arc<ColumnFile>>) {
         if !file_manager::try_exists(&dir) {
             std::fs::create_dir_all(&dir).unwrap();
@@ -607,35 +669,37 @@ mod test {
         let mut file_seq = 0;
         for (i, d) in data.iter().enumerate() {
             file_seq = i as u64 + 1;
-            let mut writer = tsm::new_tsm_writer(&dir, file_seq, false, 0).unwrap();
+            let mut writer = tsm::new_tsm_writer(&dir, file_seq, false, 0).await.unwrap();
             for (fid, data_blks) in d.iter() {
                 for blk in data_blks.iter() {
-                    writer.write_block(*fid, blk).unwrap();
+                    writer.write_block(*fid, blk).await.unwrap();
                 }
             }
-            writer.write_index().unwrap();
-            writer.finish().unwrap();
-            cfs.push(Arc::new(ColumnFile::new(
+            writer.write_index().await.unwrap();
+            writer.finish().await.unwrap();
+            let mut cf = ColumnFile::new(
                 file_seq,
                 2,
                 TimeRange::new(writer.min_ts(), writer.max_ts()),
                 writer.size(),
                 false,
                 writer.path(),
-            )));
+            );
+            cf.set_field_id_filter(Arc::new(writer.bloom_filter_cloned()));
+            cfs.push(Arc::new(cf));
         }
         (file_seq + 1, cfs)
     }
 
-    fn read_data_blocks_from_column_file(
+    async fn read_data_blocks_from_column_file(
         path: impl AsRef<Path>,
     ) -> HashMap<FieldId, Vec<DataBlock>> {
-        let tsm_reader = TsmReader::open(path).unwrap();
+        let tsm_reader = TsmReader::open(path).await.unwrap();
         let mut data: HashMap<FieldId, Vec<DataBlock>> = HashMap::new();
         for idx in tsm_reader.index_iterator() {
             let field_id = idx.field_id();
             for blk_meta in idx.block_iterator() {
-                let blk = tsm_reader.get_data_block(&blk_meta).unwrap();
+                let blk = tsm_reader.get_data_block(&blk_meta).await.unwrap();
                 data.entry(field_id).or_default().push(blk);
             }
         }
@@ -652,13 +716,13 @@ mod test {
     }
 
     /// Compare DataBlocks in path with the expected_Data using assert_eq.
-    fn check_column_file(
+    async fn check_column_file(
         dir: impl AsRef<Path>,
         version_edit: VersionEdit,
         expected_data: HashMap<FieldId, Vec<DataBlock>>,
     ) {
         let path = get_result_file_path(dir, version_edit);
-        let data = read_data_blocks_from_column_file(path);
+        let data = read_data_blocks_from_column_file(path).await;
         let mut data_field_ids = data.keys().copied().collect::<Vec<_>>();
         data_field_ids.sort_unstable();
         let mut expected_data_field_ids = expected_data.keys().copied().collect::<Vec<_>>();
@@ -676,27 +740,27 @@ mod test {
         }
     }
 
-    fn create_options(base_dir: String) -> Arc<Options> {
-        let dir = "../config/config.toml";
-        let mut config = config::get_config(dir);
+    pub(crate) fn create_options(base_dir: String) -> Arc<Options> {
+        let mut config = config::get_config_for_test();
         config.storage.path = base_dir;
         let opt = Options::from(&config);
         Arc::new(opt)
     }
 
     fn prepare_compact_req_and_kernel(
-        database: String,
+        database: Arc<String>,
         opt: Arc<Options>,
         next_file_id: u64,
         files: Vec<Arc<ColumnFile>>,
     ) -> (CompactReq, Arc<GlobalContext>) {
         let version = Arc::new(Version::new(
             1,
-            "version_1".to_string(),
+            database.clone(),
             opt.storage.clone(),
             1,
-            LevelInfo::init_levels(database.clone(), opt.storage.clone()),
+            LevelInfo::init_levels(database.clone(), 0, opt.storage.clone()),
             1000,
+            Arc::new(ShardedCache::with_capacity(1)),
         ));
         let compact_req = CompactReq {
             ts_family_id: 1,
@@ -712,8 +776,8 @@ mod test {
         (compact_req, kernel)
     }
 
-    #[test]
-    fn test_compaction_fast() {
+    #[tokio::test]
+    async fn test_compaction_fast() {
         #[rustfmt::skip]
         let data = vec![
             HashMap::from([
@@ -740,19 +804,23 @@ mod test {
         ]);
 
         let dir = "/tmp/test/compaction";
-        let database = "dba".to_string();
+        let database = Arc::new("dba".to_string());
         let opt = create_options(dir.to_string());
         let dir = opt.storage.tsm_dir(&database, 1);
 
-        let (next_file_id, files) = write_data_blocks_to_column_file(&dir, data, 1, opt.clone());
+        let (next_file_id, files) =
+            write_data_blocks_to_column_file(&dir, data, 1, opt.clone()).await;
         let (compact_req, kernel) =
             prepare_compact_req_and_kernel(database, opt, next_file_id, files);
-        let version_edit = run_compaction_job(compact_req, kernel).unwrap().unwrap();
-        check_column_file(dir, version_edit, expected_data);
+        let (version_edit, _) = run_compaction_job(compact_req, kernel)
+            .await
+            .unwrap()
+            .unwrap();
+        check_column_file(dir, version_edit, expected_data).await;
     }
 
-    #[test]
-    fn test_compaction_1() {
+    #[tokio::test]
+    async fn test_compaction_1() {
         #[rustfmt::skip]
         let data = vec![
             HashMap::from([
@@ -779,25 +847,29 @@ mod test {
         ]);
 
         let dir = "/tmp/test/compaction/1";
-        let database = "dba".to_string();
+        let database = Arc::new("dba".to_string());
         let opt = create_options(dir.to_string());
         let dir = opt.storage.tsm_dir(&database, 1);
 
-        let (next_file_id, files) = write_data_blocks_to_column_file(&dir, data, 1, opt.clone());
+        let (next_file_id, files) =
+            write_data_blocks_to_column_file(&dir, data, 1, opt.clone()).await;
         let (compact_req, kernel) =
             prepare_compact_req_and_kernel(database, opt, next_file_id, files);
-        let version_edit = run_compaction_job(compact_req, kernel).unwrap().unwrap();
-        check_column_file(dir, version_edit, expected_data);
+        let (version_edit, _) = run_compaction_job(compact_req, kernel)
+            .await
+            .unwrap()
+            .unwrap();
+        check_column_file(dir, version_edit, expected_data).await;
     }
 
-    #[test]
-    fn test_compaction_2() {
+    #[tokio::test]
+    async fn test_compaction_2() {
         #[rustfmt::skip]
         let data = vec![
             HashMap::from([
                 (1, vec![DataBlock::I64 { ts: vec![1, 2, 3, 4], val: vec![1, 2, 3, 5], enc: DataBlockEncoding::default() }]),
-                (2, vec![DataBlock::I64 { ts: vec![1, 2, 3, 4], val: vec![1, 2, 3, 5], enc: DataBlockEncoding::default() }]),
-                (3, vec![DataBlock::I64 { ts: vec![1, 2, 3], val: vec![1, 2, 3], enc: DataBlockEncoding::default() }]),
+                (3, vec![DataBlock::I64 { ts: vec![1, 2, 3, 4], val: vec![1, 2, 3, 5], enc: DataBlockEncoding::default() }]),
+                (4, vec![DataBlock::I64 { ts: vec![1, 2, 3], val: vec![1, 2, 3], enc: DataBlockEncoding::default() }]),
             ]),
             HashMap::from([
                 (1, vec![DataBlock::I64 { ts: vec![4, 5, 6], val: vec![4, 5, 6], enc: DataBlockEncoding::default() }]),
@@ -813,20 +885,25 @@ mod test {
         #[rustfmt::skip]
         let expected_data = HashMap::from([
             (1, vec![DataBlock::I64 { ts: vec![1, 2, 3, 4, 5, 6, 7, 8, 9], val: vec![1, 2, 3, 4, 5, 6, 7, 8, 9], enc: DataBlockEncoding::default() }]),
-            (2, vec![DataBlock::I64 { ts: vec![1, 2, 3, 4, 5, 6, 7, 8, 9], val: vec![1, 2, 3, 4, 5, 6, 7, 8, 9], enc: DataBlockEncoding::default() }]),
+            (2, vec![DataBlock::I64 { ts: vec![4, 5, 6, 7, 8, 9], val: vec![4, 5, 6, 7, 8, 9], enc: DataBlockEncoding::default() }]),
             (3, vec![DataBlock::I64 { ts: vec![1, 2, 3, 4, 5, 6, 7, 8, 9], val: vec![1, 2, 3, 4, 5, 6, 7, 8, 9], enc: DataBlockEncoding::default() }]),
+            (4, vec![DataBlock::I64 { ts: vec![1, 2, 3], val: vec![1, 2, 3], enc: DataBlockEncoding::default() }]),
         ]);
 
         let dir = "/tmp/test/compaction/2";
-        let database = "dba".to_string();
+        let database = Arc::new("dba".to_string());
         let opt = create_options(dir.to_string());
         let dir = opt.storage.tsm_dir(&database, 1);
 
-        let (next_file_id, files) = write_data_blocks_to_column_file(&dir, data, 1, opt.clone());
+        let (next_file_id, files) =
+            write_data_blocks_to_column_file(&dir, data, 1, opt.clone()).await;
         let (compact_req, kernel) =
             prepare_compact_req_and_kernel(database, opt, next_file_id, files);
-        let version_edit = run_compaction_job(compact_req, kernel).unwrap().unwrap();
-        check_column_file(dir, version_edit, expected_data);
+        let (version_edit, _) = run_compaction_job(compact_req, kernel)
+            .await
+            .unwrap()
+            .unwrap();
+        check_column_file(dir, version_edit, expected_data).await;
     }
 
     /// Returns a generated `DataBlock` with default value and specified size, `DataBlock::ts`
@@ -923,8 +1000,8 @@ mod test {
         }
     }
 
-    #[test]
-    fn test_compaction_3() {
+    #[tokio::test]
+    async fn test_compaction_3() {
         #[rustfmt::skip]
         let data_desc = [
             // [( tsm_sequence, vec![ (ValueType, FieldId, Timestamp_Begin, Timestamp_end) ] )]
@@ -1009,7 +1086,7 @@ mod test {
         );
 
         let dir = "/tmp/test/compaction/3";
-        let database = "dba".to_string();
+        let database = Arc::new("dba".to_string());
         let opt = create_options(dir.to_string());
         let dir = opt.storage.tsm_dir(&database, 1);
         if !file_manager::try_exists(&dir) {
@@ -1018,14 +1095,17 @@ mod test {
 
         let mut column_files = Vec::new();
         for (tsm_sequence, args) in data_desc.iter() {
-            let mut tsm_writer = tsm::new_tsm_writer(&dir, *tsm_sequence, false, 0).unwrap();
+            let mut tsm_writer = tsm::new_tsm_writer(&dir, *tsm_sequence, false, 0)
+                .await
+                .unwrap();
             for arg in args.iter() {
                 tsm_writer
                     .write_block(arg.1, &generate_data_block(arg.0, vec![(arg.2, arg.3)]))
+                    .await
                     .unwrap();
             }
-            tsm_writer.write_index().unwrap();
-            tsm_writer.finish().unwrap();
+            tsm_writer.write_index().await.unwrap();
+            tsm_writer.finish().await.unwrap();
             column_files.push(Arc::new(ColumnFile::new(
                 *tsm_sequence,
                 2,
@@ -1041,13 +1121,16 @@ mod test {
         let (compact_req, kernel) =
             prepare_compact_req_and_kernel(database, opt, next_file_id, column_files);
 
-        let version_edit = run_compaction_job(compact_req, kernel).unwrap().unwrap();
+        let (version_edit, _) = run_compaction_job(compact_req, kernel)
+            .await
+            .unwrap()
+            .unwrap();
 
-        check_column_file(dir, version_edit, expected_data);
+        check_column_file(dir, version_edit, expected_data).await;
     }
 
-    #[test]
-    fn test_compaction_4() {
+    #[tokio::test]
+    async fn test_compaction_4() {
         #[rustfmt::skip]
         let data_desc = [
             // [( tsm_sequence, vec![(ValueType, FieldId, Timestamp_Begin, Timestamp_end)], vec![Option<(FieldId, MinTimestamp, MaxTimestamp)>] )]
@@ -1150,7 +1233,7 @@ mod test {
         );
 
         let dir = "/tmp/test/compaction/4";
-        let database = "dba".to_string();
+        let database = Arc::new("dba".to_string());
         let opt = create_options(dir.to_string());
         let dir = opt.storage.tsm_dir(&database, 1);
         if !file_manager::try_exists(&dir) {
@@ -1159,22 +1242,26 @@ mod test {
 
         let mut column_files = Vec::new();
         for (tsm_sequence, tsm_desc, tombstone_desc) in data_desc.iter() {
-            let mut tsm_writer = tsm::new_tsm_writer(&dir, *tsm_sequence, false, 0).unwrap();
+            let mut tsm_writer = tsm::new_tsm_writer(&dir, *tsm_sequence, false, 0)
+                .await
+                .unwrap();
             for arg in tsm_desc.iter() {
                 tsm_writer
                     .write_block(arg.1, &generate_data_block(arg.0, vec![(arg.2, arg.3)]))
+                    .await
                     .unwrap();
             }
-            tsm_writer.write_index().unwrap();
-            tsm_writer.finish().unwrap();
-            let mut tsm_tombstone = TsmTombstone::open_for_write(&dir, *tsm_sequence).unwrap();
+            tsm_writer.write_index().await.unwrap();
+            tsm_writer.finish().await.unwrap();
+            let mut tsm_tombstone = TsmTombstone::open(&dir, *tsm_sequence).await.unwrap();
             for t in tombstone_desc.iter().flatten() {
                 tsm_tombstone
                     .add_range(&[t.0][..], &TimeRange::new(t.1, t.2))
+                    .await
                     .unwrap();
             }
 
-            tsm_tombstone.flush().unwrap();
+            tsm_tombstone.flush().await.unwrap();
             column_files.push(Arc::new(ColumnFile::new(
                 *tsm_sequence,
                 2,
@@ -1190,8 +1277,11 @@ mod test {
         let (compact_req, kernel) =
             prepare_compact_req_and_kernel(database, opt, next_file_id, column_files);
 
-        let version_edit = run_compaction_job(compact_req, kernel).unwrap().unwrap();
+        let (version_edit, _) = run_compaction_job(compact_req, kernel)
+            .await
+            .unwrap()
+            .unwrap();
 
-        check_column_file(dir, version_edit, expected_data);
+        check_column_file(dir, version_edit, expected_data).await;
     }
 }

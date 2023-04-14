@@ -1,22 +1,17 @@
 use std::sync::Arc;
-
-use async_trait::async_trait;
-use datafusion::arrow::{
-    array::{StringBuilder, UInt64Builder},
-    datatypes::{DataType, Field, Schema},
-    error::ArrowError,
-    record_batch::RecordBatch,
-};
-use snafu::ResultExt;
-use spi::{
-    query::execution::{ArrowSnafu, ExecutionError, Output, QueryState, QueryStateMachineRef},
-    service::protocol::QueryId,
-};
 use std::time::Duration;
 
-use crate::dispatcher::query_tracker::QueryTracker;
+use async_trait::async_trait;
+use datafusion::arrow::array::{StringBuilder, UInt64Builder};
+use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use datafusion::arrow::error::ArrowError;
+use datafusion::arrow::record_batch::RecordBatch;
+use spi::query::execution::{Output, QueryState, QueryStateMachineRef};
+use spi::service::protocol::QueryId;
+use spi::Result;
 
 use super::SystemTask;
+use crate::dispatcher::query_tracker::QueryTracker;
 
 pub struct ShowQueriesTask {
     query_tracker: Arc<QueryTracker>,
@@ -30,10 +25,7 @@ impl ShowQueriesTask {
 
 #[async_trait]
 impl SystemTask for ShowQueriesTask {
-    async fn execute(
-        &self,
-        _query_state_machine: QueryStateMachineRef,
-    ) -> std::result::Result<Output, ExecutionError> {
+    async fn execute(&self, _query_state_machine: QueryStateMachineRef) -> Result<Output> {
         let mut result_builder = ShowQueriesResultBuilder::new();
 
         self.query_tracker.running_queries().iter().for_each(|e| {
@@ -41,7 +33,7 @@ impl SystemTask for ShowQueriesTask {
             let status = e.status();
             result_builder.add_column(
                 info.query_id(),
-                info.user(),
+                info.user_name(),
                 info.query(),
                 status.query_state(),
                 status.duration(),
@@ -49,12 +41,15 @@ impl SystemTask for ShowQueriesTask {
         });
 
         Ok(Output::StreamData(
-            result_builder.build().context(ArrowSnafu)?,
+            result_builder.schema(),
+            result_builder.build()?,
         ))
     }
 }
 
 struct ShowQueriesResultBuilder {
+    schema: SchemaRef,
+
     query_ids: StringBuilder,
     users: StringBuilder,
     queries: StringBuilder,
@@ -64,7 +59,16 @@ struct ShowQueriesResultBuilder {
 
 impl ShowQueriesResultBuilder {
     fn new() -> Self {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("query_id", DataType::Utf8, false),
+            Field::new("user", DataType::Utf8, false),
+            Field::new("query", DataType::Utf8, false),
+            Field::new("state", DataType::Utf8, false),
+            Field::new("duration", DataType::UInt64, false),
+        ]));
+
         Self {
+            schema,
             query_ids: StringBuilder::new(),
             users: StringBuilder::new(),
             queries: StringBuilder::new(),
@@ -85,20 +89,17 @@ impl ShowQueriesResultBuilder {
         self.query_ids.append_value(query_id.to_string());
         self.users.append_value(user.as_ref());
         self.queries.append_value(query.as_ref());
-        self.states.append_value(state.to_string());
+        self.states.append_value(state.as_ref());
         self.durations.append_value(duration.as_millis() as u64);
     }
 
-    fn build(self) -> Result<Vec<RecordBatch>, ArrowError> {
-        let schema = Schema::new(vec![
-            Field::new("query_id", DataType::Utf8, false),
-            Field::new("user", DataType::Utf8, false),
-            Field::new("query", DataType::Utf8, false),
-            Field::new("state", DataType::Utf8, false),
-            Field::new("duration", DataType::UInt64, false),
-        ]);
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
 
+    fn build(self) -> std::result::Result<Vec<RecordBatch>, ArrowError> {
         let ShowQueriesResultBuilder {
+            schema,
             mut query_ids,
             mut users,
             mut queries,
@@ -106,7 +107,6 @@ impl ShowQueriesResultBuilder {
             mut durations,
         } = self;
 
-        let schema = Arc::new(schema);
         let batch = RecordBatch::try_new(
             schema,
             vec![

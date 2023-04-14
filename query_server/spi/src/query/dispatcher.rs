@@ -1,11 +1,13 @@
 use std::time::Duration;
 
-use crate::query::execution::Output;
-use crate::service::protocol::{Query, QueryId};
 use async_trait::async_trait;
+use models::auth::user::UserDesc;
+use models::oid::{Identifier, Oid};
 
 use super::execution::QueryState;
-use super::Result;
+use crate::query::execution::Output;
+use crate::service::protocol::{Query, QueryId};
+use crate::Result;
 
 #[async_trait]
 pub trait QueryDispatcher: Send + Sync {
@@ -17,7 +19,7 @@ pub trait QueryDispatcher: Send + Sync {
 
     fn query_info(&self, id: &QueryId);
 
-    async fn execute_query(&self, id: QueryId, query: &Query) -> Result<Vec<Output>>;
+    async fn execute_query(&self, tenant_id: Oid, id: QueryId, query: &Query) -> Result<Output>;
 
     fn running_query_infos(&self) -> Vec<QueryInfo>;
 
@@ -30,14 +32,25 @@ pub trait QueryDispatcher: Send + Sync {
 pub struct QueryInfo {
     query_id: QueryId,
     query: String,
-    user: String,
+
+    tenant_id: Oid,
+    tenant_name: String,
+    user: UserDesc,
 }
 
 impl QueryInfo {
-    pub fn new(query_id: QueryId, query: String, user: String) -> Self {
+    pub fn new(
+        query_id: QueryId,
+        query: String,
+        tenant_id: Oid,
+        tenant_name: String,
+        user: UserDesc,
+    ) -> Self {
         Self {
             query_id,
             query,
+            tenant_id,
+            tenant_name,
             user,
         }
     }
@@ -50,8 +63,20 @@ impl QueryInfo {
         &self.query
     }
 
-    pub fn user(&self) -> &str {
-        &self.user
+    pub fn tenant_id(&self) -> Oid {
+        self.tenant_id
+    }
+
+    pub fn tenant_name(&self) -> &str {
+        &self.tenant_name
+    }
+
+    pub fn user_id(&self) -> Oid {
+        *self.user.id()
+    }
+
+    pub fn user_name(&self) -> &str {
+        self.user.name()
     }
 }
 
@@ -59,11 +84,18 @@ impl QueryInfo {
 pub struct QueryStatus {
     state: QueryState,
     duration: Duration,
+    processed_count: u64,
+    error_count: u64,
 }
 
 impl QueryStatus {
     pub fn new(state: QueryState, duration: Duration) -> Self {
-        Self { state, duration }
+        Self {
+            state,
+            duration,
+            processed_count: 0,
+            error_count: 0,
+        }
     }
 
     pub fn query_state(&self) -> &QueryState {
@@ -72,5 +104,50 @@ impl QueryStatus {
 
     pub fn duration(&self) -> &Duration {
         &self.duration
+    }
+
+    pub fn processed_count(&self) -> u64 {
+        self.processed_count
+    }
+
+    pub fn error_count(&self) -> u64 {
+        self.error_count
+    }
+}
+
+pub struct QueryStatusBuilder {
+    state: QueryState,
+    duration: Duration,
+    processed_count: u64,
+    error_count: u64,
+}
+
+impl QueryStatusBuilder {
+    pub fn new(state: QueryState, duration: Duration) -> Self {
+        Self {
+            state,
+            duration,
+            processed_count: 0,
+            error_count: 0,
+        }
+    }
+
+    pub fn with_processed_count(mut self, processed_count: u64) -> Self {
+        self.processed_count = processed_count;
+        self
+    }
+
+    pub fn with_error_count(mut self, error_count: u64) -> Self {
+        self.error_count = error_count;
+        self
+    }
+
+    pub fn build(self) -> QueryStatus {
+        QueryStatus {
+            state: self.state,
+            duration: self.duration,
+            processed_count: self.processed_count,
+            error_count: self.error_count,
+        }
     }
 }

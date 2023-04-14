@@ -1,137 +1,245 @@
 use std::collections::{HashMap, HashSet};
+use std::iter;
 use std::option::Option;
 use std::sync::Arc;
 
-use datafusion::common::{DFField, ToDFSchema};
-use datafusion::datasource::{source_as_provider, TableProvider};
-use datafusion::error::DataFusionError;
-use datafusion::logical_expr::logical_plan::Analyze;
-use datafusion::logical_expr::{
-    Explain, Extension, LogicalPlan, LogicalPlanBuilder, PlanType, Projection, TableSource,
-    ToStringifiedPlan,
+use async_recursion::async_recursion;
+use async_trait::async_trait;
+use datafusion::arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+use datafusion::arrow::error::ArrowError;
+use datafusion::common::parsers::CompressionTypeVariant;
+use datafusion::common::{
+    Column, DFField, DFSchema, OwnedTableReference, Result as DFResult, ToDFSchema,
 };
-use datafusion::prelude::{cast, lit, Expr};
+use datafusion::datasource::file_format::avro::AvroFormat;
+use datafusion::datasource::file_format::csv::CsvFormat;
+use datafusion::datasource::file_format::file_type::FileType;
+use datafusion::datasource::file_format::json::JsonFormat;
+use datafusion::datasource::file_format::parquet::ParquetFormat;
+use datafusion::datasource::file_format::FileFormat;
+use datafusion::datasource::listing::{
+    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+};
+use datafusion::error::DataFusionError;
+use datafusion::execution::context::SessionState;
+use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion::logical_expr::expr::Sort;
+use datafusion::logical_expr::logical_plan::Analyze;
+use datafusion::logical_expr::utils::expr_to_columns;
+use datafusion::logical_expr::{
+    lit, BinaryExpr, BuiltinScalarFunction, Case, CreateExternalTable as PlanCreateExternalTable,
+    EmptyRelation, Explain, Expr, LogicalPlan, LogicalPlanBuilder, Operator, PlanType,
+    SubqueryAlias, TableSource, ToStringifiedPlan, Union,
+};
+use datafusion::prelude::{col, SessionConfig};
 use datafusion::scalar::ScalarValue;
 use datafusion::sql::parser::CreateExternalTable as AstCreateExternalTable;
-use datafusion::sql::planner::{ContextProvider, SqlToRel};
+use datafusion::sql::planner::{object_name_to_table_reference, SqlToRel};
 use datafusion::sql::sqlparser::ast::{
-    DataType as SQLDataType, Ident, ObjectName, Query, Statement,
+    DataType as SQLDataType, Expr as ASTExpr, Ident, ObjectName, Offset, OrderByExpr, Query,
+    SqlOption, Statement, TableAlias, TableFactor, TimezoneInfo,
 };
+use datafusion::sql::sqlparser::parser::ParserError;
 use datafusion::sql::TableReference;
-use models::schema::{ColumnType, TableColumn, TIME_FIELD_NAME};
+use lazy_static::__Deref;
+use meta::error::MetaError;
+use models::auth::privilege::{
+    DatabasePrivilege, GlobalPrivilege, Privilege, TenantObjectPrivilege,
+};
+use models::auth::role::{SystemTenantRole, TenantRoleIdentifier};
+use models::auth::user::User;
+use models::object_reference::{Resolve, ResolvedTable};
+use models::oid::{Identifier, Oid};
+use models::schema::{
+    ColumnType, DatabaseOptions, Duration, Precision, TableColumn, Tenant, TskvTableSchema,
+    TskvTableSchemaRef, Watermark, DEFAULT_CATALOG, DEFAULT_DATABASE, TIME_FIELD,
+};
 use models::utils::SeqIdGenerator;
 use models::{ColumnId, ValueType};
-use snafu::ResultExt;
+use object_store::ObjectStore;
+use spi::query::ast;
 use spi::query::ast::{
     AlterDatabase as ASTAlterDatabase, AlterTable as ASTAlterTable,
-    AlterTableAction as ASTAlterTableAction, ColumnOption, CreateDatabase as ASTCreateDatabase,
+    AlterTableAction as ASTAlterTableAction, AlterTenantOperation, AlterUserOperation,
+    ChecksumGroup as ASTChecksumGroup, ColumnOption, CompactVnode as ASTCompactVnode,
+    CopyIntoTable, CopyTarget, CopyVnode as ASTCopyVnode, CreateDatabase as ASTCreateDatabase,
     CreateTable as ASTCreateTable, DatabaseOptions as ASTDatabaseOptions,
-    DescribeDatabase as DescribeDatabaseOptions, DescribeTable as DescribeTableOptions, DropObject,
-    ExtStatement,
+    DescribeDatabase as DescribeDatabaseOptions, DescribeTable as DescribeTableOptions,
+    DropVnode as ASTDropVnode, ExtStatement, MoveVnode as ASTMoveVnode,
+    ShowSeries as ASTShowSeries, ShowTagBody, ShowTagValues as ASTShowTagValues, UriLocation, With,
 };
+use spi::query::datasource::{self, UriSchema};
 use spi::query::logical_planner::{
-    self, affected_row_expr, merge_affected_row_expr, AlterDatabase, AlterTable, AlterTableAction,
-    CreateDatabase, CreateTable, DDLPlan, DescribeDatabase, DescribeTable, DropPlan, ExternalSnafu,
-    LogicalPlanner, LogicalPlannerError, Plan, QueryPlan, SYSPlan, MISMATCHED_COLUMNS,
-    MISSING_COLUMN,
+    parse_connection_options, sql_option_to_alter_tenant_action, sql_options_to_map,
+    sql_options_to_tenant_options, sql_options_to_user_options,
+    unset_option_to_alter_tenant_action, AlterDatabase, AlterTable, AlterTableAction, AlterTenant,
+    AlterTenantAction, AlterTenantAddUser, AlterTenantSetUser, AlterUser, AlterUserAction,
+    ChecksumGroup, CompactVnode, CopyOptions, CopyOptionsBuilder, CopyVnode, CreateDatabase,
+    CreateRole, CreateStreamTable, CreateTable, CreateTenant, CreateUser, DDLPlan,
+    DatabaseObjectType, DescribeDatabase, DescribeTable, DropDatabaseObject, DropGlobalObject,
+    DropTenantObject, DropVnode, FileFormatOptions, FileFormatOptionsBuilder, GlobalObjectType,
+    GrantRevoke, LogicalPlanner, MoveVnode, Plan, PlanWithPrivileges, QueryPlan, SYSPlan,
+    TenantObjectType,
 };
-use spi::query::session::IsiphoSessionCtx;
+use spi::query::session::SessionCtx;
+use spi::{QueryError, Result};
+use trace::{debug, warn};
+use url::Url;
 
-use models::schema::{DatabaseOptions, Duration, Precision};
-use spi::catalog::MetadataError;
-use spi::query::logical_planner::Result;
-use spi::query::UNEXPECTED_EXTERNAL_PLAN;
-use trace::debug;
-
-use crate::extension::logical::plan_node::table_writer::TableWriterPlanNode;
-use crate::sql::parser::{normalize_ident, normalize_sql_object_name};
-use crate::table::ClusterTable;
-use spi::query::logical_planner::MetadataSnafu;
+use crate::data_source::source_downcast_adapter;
+use crate::data_source::stream::{get_event_time_column, get_watermark_delay};
+use crate::data_source::table_source::{TableHandle, TableSourceAdapter, TEMP_LOCATION_TABLE_NAME};
+use crate::extension::logical::logical_plan_builder::LogicalPlanBuilderExt;
+use crate::metadata::{ContextProviderExtension, DatabaseSet, CLUSTER_SCHEMA, INFORMATION_SCHEMA};
+use crate::sql::parser::{merge_object_name, normalize_ident, normalize_sql_object_name};
 
 /// CnosDB SQL query planner
-#[derive(Debug)]
-pub struct SqlPlaner<S> {
-    schema_provider: S,
+pub struct SqlPlaner<'a, S: ContextProviderExtension> {
+    schema_provider: &'a S,
+    df_planner: SqlToRel<'a, S>,
 }
 
-impl<S: ContextProvider> SqlPlaner<S> {
+impl<'a, S: ContextProviderExtension + Send + Sync + 'a> SqlPlaner<'a, S> {
     /// Create a new query planner
-    pub fn new(schema_provider: S) -> Self {
-        SqlPlaner { schema_provider }
-    }
-
-    /// Generate a logical plan from an  Extent SQL statement
-    pub(crate) fn statement_to_plan(&self, statement: ExtStatement) -> Result<Plan> {
-        match statement {
-            ExtStatement::SqlStatement(stmt) => self.df_sql_to_plan(*stmt),
-            ExtStatement::CreateExternalTable(stmt) => self.external_table_to_plan(stmt),
-            ExtStatement::CreateTable(stmt) => self.create_table_to_plan(stmt),
-            ExtStatement::CreateDatabase(stmt) => self.database_to_plan(stmt),
-            ExtStatement::CreateUser(_) => todo!(),
-            ExtStatement::Drop(s) => self.drop_object_to_plan(s),
-            ExtStatement::DropUser(_) => todo!(),
-            ExtStatement::DescribeTable(stmt) => self.table_to_describe(stmt),
-            ExtStatement::DescribeDatabase(stmt) => self.database_to_describe(stmt),
-            ExtStatement::ShowDatabases() => self.database_to_show(),
-            ExtStatement::ShowTables(stmt) => self.table_to_show(stmt),
-            ExtStatement::AlterDatabase(stmt) => self.database_to_alter(stmt),
-            ExtStatement::AlterTable(stmt) => self.table_to_alter(stmt),
-            // system statement
-            ExtStatement::ShowQueries => Ok(Plan::SYSTEM(SYSPlan::ShowQueries)),
+    pub fn new(schema_provider: &'a S) -> Self {
+        SqlPlaner {
+            schema_provider,
+            df_planner: SqlToRel::new(schema_provider),
         }
     }
 
-    fn df_sql_to_plan(&self, stmt: Statement) -> Result<Plan> {
+    /// Generate a logical plan from an  Extent SQL statement
+    #[async_recursion]
+    pub(crate) async fn statement_to_plan(
+        &self,
+        statement: ExtStatement,
+        session: &SessionCtx,
+    ) -> Result<PlanWithPrivileges> {
+        match statement {
+            ExtStatement::SqlStatement(stmt) => self.df_sql_to_plan(*stmt, session).await,
+            ExtStatement::CreateExternalTable(stmt) => self.external_table_to_plan(stmt, session),
+            ExtStatement::CreateTable(stmt) => self.create_table_to_plan(stmt, session),
+            ExtStatement::CreateDatabase(stmt) => self.database_to_plan(stmt, session),
+            ExtStatement::CreateTenant(stmt) => self.create_tenant_to_plan(stmt),
+            ExtStatement::CreateUser(stmt) => self.create_user_to_plan(stmt),
+            ExtStatement::CreateRole(stmt) => self.create_role_to_plan(stmt, session),
+            ExtStatement::DropDatabaseObject(s) => self.drop_database_object_to_plan(s, session),
+            ExtStatement::DropTenantObject(s) => self.drop_tenant_object_to_plan(s, session),
+            ExtStatement::DropGlobalObject(s) => self.drop_global_object_to_plan(s),
+            ExtStatement::DescribeTable(stmt) => self.table_to_describe(stmt, session),
+            ExtStatement::DescribeDatabase(stmt) => self.database_to_describe(stmt, session),
+            ExtStatement::ShowDatabases() => self.database_to_show(session),
+            ExtStatement::ShowTables(stmt) => self.table_to_show(stmt, session),
+            ExtStatement::AlterDatabase(stmt) => self.database_to_alter(stmt, session),
+            ExtStatement::ShowSeries(stmt) => self.show_series_to_plan(*stmt, session),
+            ExtStatement::Explain(stmt) => {
+                self.explain_statement_to_plan(
+                    stmt.analyze,
+                    stmt.verbose,
+                    *stmt.ext_statement,
+                    session,
+                )
+                .await
+            }
+            ExtStatement::ShowTagValues(stmt) => self.show_tag_values(*stmt, session),
+            ExtStatement::AlterTable(stmt) => self.table_to_alter(stmt, session),
+            ExtStatement::AlterTenant(stmt) => self.alter_tenant_to_plan(stmt).await,
+            ExtStatement::AlterUser(stmt) => self.alter_user_to_plan(stmt).await,
+            ExtStatement::GrantRevoke(stmt) => self.grant_revoke_to_plan(stmt, session),
+            // system statement
+            ExtStatement::ShowQueries => {
+                let plan = Plan::SYSTEM(SYSPlan::ShowQueries);
+                // TODO privileges
+                Ok(PlanWithPrivileges {
+                    plan,
+                    privileges: vec![],
+                })
+            }
+            ExtStatement::Copy(stmt) => self.copy_to_plan(stmt, session).await,
+            // vnode statement
+            ExtStatement::DropVnode(stmt) => self.drop_vnode_to_plan(stmt),
+            ExtStatement::CopyVnode(stmt) => self.copy_vnode_to_plan(stmt),
+            ExtStatement::MoveVnode(stmt) => self.move_vnode_to_plan(stmt),
+            ExtStatement::CompactVnode(stmt) => self.compact_vnode_to_plan(stmt),
+            ExtStatement::ChecksumGroup(stmt) => self.checksum_group_to_plan(stmt),
+            ExtStatement::CreateStream(_) => Err(QueryError::NotImplemented {
+                err: "CreateStream Planner.".to_string(),
+            }),
+            ExtStatement::DropStream(_) => Err(QueryError::NotImplemented {
+                err: "DropStream Planner.".to_string(),
+            }),
+            ExtStatement::ShowStreams(_) => Err(QueryError::NotImplemented {
+                err: "ShowStreams Planner.".to_string(),
+            }),
+            ExtStatement::CreateStreamTable(stmt) => {
+                self.create_stream_table_to_plan(stmt, session)
+            }
+        }
+    }
+
+    async fn df_sql_to_plan(
+        &self,
+        stmt: Statement,
+        session: &SessionCtx,
+    ) -> Result<PlanWithPrivileges> {
         match stmt {
             Statement::Query(_) => {
-                let df_planner = SqlToRel::new(&self.schema_provider);
-                let df_plan = df_planner
-                    .sql_statement_to_plan(stmt)
-                    .context(ExternalSnafu)?;
-                Ok(Plan::Query(QueryPlan { df_plan }))
+                let df_plan = self.df_planner.sql_statement_to_plan(stmt)?;
+                let plan = Plan::Query(QueryPlan { df_plan });
+
+                // privileges
+                let access_databases = self.schema_provider.reset_access_databases();
+                let privileges = databases_privileges(
+                    DatabasePrivilege::Read,
+                    *session.tenant_id(),
+                    access_databases,
+                );
+                Ok(PlanWithPrivileges { plan, privileges })
             }
-            Statement::Explain {
-                verbose,
-                statement,
-                analyze,
-                describe_alias: _,
-                format: _,
-            } => self.explain_statement_to_plan(verbose, analyze, *statement),
             Statement::Insert {
-                table_name: ref sql_object_name,
+                table_name: sql_object_name,
                 columns: ref sql_column_names,
                 source,
                 ..
-            } => self.insert_to_plan(sql_object_name, sql_column_names, source),
-            Statement::Kill { id, .. } => Ok(Plan::SYSTEM(SYSPlan::KillQuery(id.into()))),
-            _ => Err(LogicalPlannerError::NotImplemented {
+            } => {
+                self.insert_to_plan(sql_object_name, sql_column_names, source, session)
+                    .await
+            }
+            Statement::Kill { id, .. } => {
+                let plan = Plan::SYSTEM(SYSPlan::KillQuery(id.into()));
+                // TODO privileges
+                Ok(PlanWithPrivileges {
+                    plan,
+                    privileges: vec![],
+                })
+            }
+            _ => Err(QueryError::NotImplemented {
                 err: stmt.to_string(),
             }),
         }
     }
 
     /// Generate a plan for EXPLAIN ... that will print out a plan
-    ///
-    pub fn explain_statement_to_plan(
+    async fn explain_statement_to_plan(
         &self,
         verbose: bool,
         analyze: bool,
-        statement: Statement,
-    ) -> Result<Plan> {
-        let plan = self.df_sql_to_plan(statement)?;
+        statement: ExtStatement,
+        session: &SessionCtx,
+    ) -> Result<PlanWithPrivileges> {
+        let PlanWithPrivileges { plan, privileges } =
+            self.statement_to_plan(statement, session).await?;
 
         let input_df_plan = match plan {
             Plan::Query(query) => Arc::new(query.df_plan),
             _ => {
-                return Err(LogicalPlannerError::NotImplemented {
+                return Err(QueryError::NotImplemented {
                     err: "explain non-query statement.".to_string(),
-                })
+                });
             }
         };
 
-        let schema = LogicalPlan::explain_schema()
-            .to_dfschema_ref()
-            .context(ExternalSnafu)?;
+        let schema = LogicalPlan::explain_schema().to_dfschema_ref()?;
 
         let df_plan = if analyze {
             LogicalPlan::Analyze(Analyze {
@@ -147,88 +255,36 @@ impl<S: ContextProvider> SqlPlaner<S> {
                 plan: input_df_plan,
                 stringified_plans,
                 schema,
+                logical_optimization_succeeded: false,
             })
         };
 
-        Ok(Plan::Query(QueryPlan { df_plan }))
+        let plan = Plan::Query(QueryPlan { df_plan });
+
+        Ok(PlanWithPrivileges { plan, privileges })
     }
 
-    /// Add a projection operation (if necessary)
-    /// 1. Iterate over all fields of the table
-    ///   1.1. Construct the col expression
-    ///   1.2. Check if the current field exists in columns
-    ///     1.2.1. does not exist: add cast(null as target_type) expression to save
-    ///     1.2.1. Exist: save if the type matches, add cast(expr as target_type) to save if it does not exist
-    fn add_projection_between_source_and_insert_node_if_necessary(
+    async fn insert_to_plan(
         &self,
-        target_table: Arc<dyn TableSource>,
-        source_plan: LogicalPlan,
-        insert_columns: Vec<String>,
-    ) -> Result<LogicalPlan> {
-        let insert_col_name_with_source_field_tuples: Vec<(&String, &DFField)> = insert_columns
-            .iter()
-            .zip(source_plan.schema().fields())
-            .collect();
-
-        debug!(
-            "Insert col name with source field tuples: {:?}",
-            insert_col_name_with_source_field_tuples
-        );
-        debug!("Target table: {:?}", target_table.schema());
-
-        let assignments: Vec<Expr> = target_table
-            .schema()
-            .fields()
-            .iter()
-            .map(|column| {
-                let target_column_name = column.name();
-                let target_column_data_type = column.data_type();
-
-                let expr = if let Some((_, source_field)) = insert_col_name_with_source_field_tuples
-                    .iter()
-                    .find(|(insert_col_name, _)| *insert_col_name == target_column_name)
-                {
-                    // insert column exists in the target table
-                    if source_field.data_type() == target_column_data_type {
-                        // save if type matches col(source_field_name)
-                        Expr::Column(source_field.qualified_column())
-                    } else {
-                        // Add cast(source_col as target_type) if it doesn't exist
-                        cast(
-                            Expr::Column(source_field.qualified_column()),
-                            target_column_data_type.clone(),
-                        )
-                    }
-                } else {
-                    // The specified column in the target table is missing from the insert
-                    // then add cast(null as target_type)
-                    cast(lit(ScalarValue::Null), target_column_data_type.clone())
-                };
-
-                expr.alias(target_column_name)
-            })
-            .collect();
-
-        debug!("assignments: {:?}", &assignments);
-
-        Ok(LogicalPlan::Projection(
-            Projection::try_new(assignments, Arc::new(source_plan), None)
-                .context(logical_planner::ExternalSnafu)?,
-        ))
-    }
-
-    fn insert_to_plan(
-        &self,
-        sql_object_name: &ObjectName,
+        sql_object_name: ObjectName,
         sql_column_names: &[Ident],
         source: Box<Query>,
-    ) -> Result<Plan> {
+        session: &SessionCtx,
+    ) -> Result<PlanWithPrivileges> {
         // Transform subqueries
-        let source_plan = SqlToRel::new(&self.schema_provider)
-            .query_to_plan(*source, &mut HashMap::new())
-            .context(logical_planner::ExternalSnafu)?;
+        let source_plan = self
+            .df_planner
+            .sql_statement_to_plan(Statement::Query(source))?;
 
-        let table_name = normalize_sql_object_name(sql_object_name);
+        // save database read privileges
+        // This operation must be done before fetching the target table metadata
+        let mut read_privileges = databases_privileges(
+            DatabasePrivilege::Read,
+            *session.tenant_id(),
+            self.schema_provider.reset_access_databases(),
+        );
+
+        let table_name = object_name_to_resolved_table(session, sql_object_name)?;
         let columns = sql_column_names
             .iter()
             .map(normalize_ident)
@@ -236,53 +292,257 @@ impl<S: ContextProvider> SqlPlaner<S> {
 
         // Get the metadata of the target table
         let target_table = self.get_table_source(&table_name)?;
-        let insert_columns = self.extract_column_names(columns.as_ref(), target_table.clone());
 
-        // Check if the plan is legal
-        semantic_check(insert_columns.as_ref(), &source_plan, target_table.clone())?;
+        let build_plan_func = || {
+            LogicalPlanBuilder::from(source_plan)
+                .write(target_table, table_name.table(), columns.as_ref())?
+                .build()
+        };
 
-        let final_source_logical_plan = self
-            .add_projection_between_source_and_insert_node_if_necessary(
-                target_table.clone(),
-                source_plan,
-                insert_columns,
-            )?;
-
-        let df_plan = table_write_plan_node(table_name, target_table, final_source_logical_plan)
-            .context(logical_planner::ExternalSnafu)?;
+        let df_plan = build_plan_func()?;
 
         debug!("Insert plan:\n{}", df_plan.display_indent_schema());
 
-        Ok(Plan::Query(QueryPlan { df_plan }))
+        let plan = Plan::Query(QueryPlan { df_plan });
+
+        // privileges
+        let mut write_privileges = databases_privileges(
+            DatabasePrivilege::Write,
+            *session.tenant_id(),
+            self.schema_provider.reset_access_databases(),
+        );
+        write_privileges.append(&mut read_privileges);
+        Ok(PlanWithPrivileges {
+            plan,
+            privileges: write_privileges,
+        })
     }
 
-    fn drop_object_to_plan(&self, stmt: DropObject) -> Result<Plan> {
-        Ok(Plan::DDL(DDLPlan::Drop(DropPlan {
-            if_exist: stmt.if_exist,
-            object_name: normalize_sql_object_name(&stmt.object_name),
-            obj_type: stmt.obj_type,
-        })))
+    fn drop_database_object_to_plan(
+        &self,
+        stmt: ast::DropDatabaseObject,
+        session: &SessionCtx,
+    ) -> Result<PlanWithPrivileges> {
+        let ast::DropDatabaseObject {
+            object_name,
+            if_exist,
+            ref obj_type,
+        } = stmt;
+        // get the current tenant id from the session
+        let tenant_id = *session.tenant_id();
+
+        let (plan, privilege) = match obj_type {
+            DatabaseObjectType::Table => {
+                let table = object_name_to_resolved_table(session, object_name)?;
+                let database_name = table.database().to_string();
+                (
+                    DDLPlan::DropDatabaseObject(DropDatabaseObject {
+                        if_exist,
+                        object_name: table,
+                        obj_type: DatabaseObjectType::Table,
+                    }),
+                    Privilege::TenantObject(
+                        TenantObjectPrivilege::Database(
+                            DatabasePrivilege::Full,
+                            Some(database_name),
+                        ),
+                        Some(tenant_id),
+                    ),
+                )
+            }
+        };
+
+        Ok(PlanWithPrivileges {
+            plan: Plan::DDL(plan),
+            privileges: vec![privilege],
+        })
+    }
+
+    fn drop_tenant_object_to_plan(
+        &self,
+        stmt: ast::DropTenantObject,
+        session: &SessionCtx,
+    ) -> Result<PlanWithPrivileges> {
+        let ast::DropTenantObject {
+            ref object_name,
+            if_exist,
+            ref obj_type,
+        } = stmt;
+        // get the current tenant id from the session
+        let tenant_name = session.tenant();
+        let tenant_id = *session.tenant_id();
+
+        let (plan, privilege) = match obj_type {
+            TenantObjectType::Database => {
+                let database_name = normalize_ident(object_name);
+                if database_name.eq(DEFAULT_DATABASE) {
+                    return Err(QueryError::ForbidDropDatabase {
+                        name: database_name,
+                    });
+                }
+                (
+                    DDLPlan::DropTenantObject(DropTenantObject {
+                        tenant_name: tenant_name.to_string(),
+                        name: database_name.clone(),
+                        if_exist,
+                        obj_type: TenantObjectType::Database,
+                    }),
+                    Privilege::TenantObject(
+                        TenantObjectPrivilege::Database(
+                            DatabasePrivilege::Full,
+                            Some(database_name),
+                        ),
+                        Some(tenant_id),
+                    ),
+                )
+            }
+            TenantObjectType::Role => {
+                let role_name = normalize_ident(object_name);
+                (
+                    DDLPlan::DropTenantObject(DropTenantObject {
+                        tenant_name: tenant_name.to_string(),
+                        name: role_name,
+                        if_exist,
+                        obj_type: TenantObjectType::Role,
+                    }),
+                    Privilege::TenantObject(TenantObjectPrivilege::RoleFull, Some(tenant_id)),
+                )
+            }
+        };
+
+        Ok(PlanWithPrivileges {
+            plan: Plan::DDL(plan),
+            privileges: vec![privilege],
+        })
+    }
+
+    fn drop_global_object_to_plan(
+        &self,
+        stmt: ast::DropGlobalObject,
+    ) -> Result<PlanWithPrivileges> {
+        let ast::DropGlobalObject {
+            ref object_name,
+            if_exist,
+            ref obj_type,
+        } = stmt;
+
+        let (plan, privilege) = match obj_type {
+            GlobalObjectType::Tenant => {
+                let tenant_name = normalize_ident(object_name);
+                if tenant_name == DEFAULT_CATALOG {
+                    return Err(QueryError::ForbidDropTenant { name: tenant_name });
+                }
+
+                (
+                    DDLPlan::DropGlobalObject(DropGlobalObject {
+                        if_exist,
+                        name: tenant_name,
+                        obj_type: GlobalObjectType::Tenant,
+                    }),
+                    Privilege::Global(GlobalPrivilege::Tenant(None)),
+                )
+            }
+            GlobalObjectType::User => {
+                let user_name = normalize_ident(object_name);
+                (
+                    DDLPlan::DropGlobalObject(DropGlobalObject {
+                        if_exist,
+                        name: user_name,
+                        obj_type: GlobalObjectType::User,
+                    }),
+                    Privilege::Global(GlobalPrivilege::User(None)),
+                )
+            }
+        };
+
+        Ok(PlanWithPrivileges {
+            plan: Plan::DDL(plan),
+            privileges: vec![privilege],
+        })
+    }
+
+    /// Copy from DataFusion
+    fn df_external_table_to_plan(
+        &self,
+        statement: AstCreateExternalTable,
+    ) -> Result<PlanCreateExternalTable> {
+        let definition = Some(statement.to_string());
+        let AstCreateExternalTable {
+            name,
+            columns,
+            file_type,
+            has_header,
+            delimiter,
+            location,
+            table_partition_cols,
+            if_not_exists,
+            file_compression_type,
+            options,
+        } = statement;
+
+        // semantic checks
+        if file_type == "PARQUET" && !columns.is_empty() {
+            Err(DataFusionError::Plan(
+                "Column definitions can not be specified for PARQUET files.".into(),
+            ))?;
+        }
+
+        if file_type != "CSV"
+            && file_type != "JSON"
+            && file_compression_type != CompressionTypeVariant::UNCOMPRESSED
+        {
+            Err(DataFusionError::Plan(
+                "File compression type can be specified for CSV/JSON files.".into(),
+            ))?;
+        }
+
+        let schema = self.df_planner.build_schema(columns)?;
+
+        // External tables do not support schemas at the moment, so the name is just a table name
+        let name = OwnedTableReference::Bare { table: name };
+
+        Ok(PlanCreateExternalTable {
+            schema: schema.to_dfschema_ref()?,
+            name,
+            location,
+            file_type,
+            has_header,
+            delimiter,
+            table_partition_cols,
+            if_not_exists,
+            definition,
+            file_compression_type,
+            options,
+        })
     }
 
     /// Generate a logical plan from a CREATE EXTERNAL TABLE statement
-    pub fn external_table_to_plan(&self, statement: AstCreateExternalTable) -> Result<Plan> {
-        let df_planner = SqlToRel::new(&self.schema_provider);
+    pub fn external_table_to_plan(
+        &self,
+        statement: AstCreateExternalTable,
+        session: &SessionCtx,
+    ) -> Result<PlanWithPrivileges> {
+        let table_name = statement.name.clone();
+        let (database_name, _) = extract_database_table_name(table_name.as_str(), session);
 
-        let logical_plan = df_planner
-            .external_table_to_plan(statement)
-            .context(ExternalSnafu)?;
+        let logical_plan = self.df_external_table_to_plan(statement)?;
 
-        if let LogicalPlan::CreateExternalTable(plan) = logical_plan {
-            return Ok(Plan::DDL(DDLPlan::CreateExternalTable(plan)));
-        }
-
-        Err(DataFusionError::Internal(
-            UNEXPECTED_EXTERNAL_PLAN.to_string(),
-        ))
-        .context(ExternalSnafu)
+        let plan = Plan::DDL(DDLPlan::CreateExternalTable(logical_plan));
+        // privileges
+        Ok(PlanWithPrivileges {
+            plan,
+            privileges: vec![Privilege::TenantObject(
+                TenantObjectPrivilege::Database(DatabasePrivilege::Full, Some(database_name)),
+                Some(*session.tenant_id()),
+            )],
+        })
     }
 
-    pub fn create_table_to_plan(&self, statement: ASTCreateTable) -> Result<Plan> {
+    pub fn create_table_to_plan(
+        &self,
+        statement: ASTCreateTable,
+        session: &SessionCtx,
+    ) -> Result<PlanWithPrivileges> {
         let ASTCreateTable {
             name,
             if_not_exists,
@@ -293,111 +553,167 @@ impl<S: ContextProvider> SqlPlaner<S> {
         // sys inner time column
         let mut schema: Vec<TableColumn> = Vec::with_capacity(columns.len() + 1);
 
-        let time_col = TableColumn::new_time_column(id_generator.next_id() as ColumnId);
+        let resolved_table = object_name_to_resolved_table(session, name)?;
+        let database_name = resolved_table.database().to_string();
+        let unit: TimeUnit = self.get_db_precision(&database_name)?.into();
+
+        let time_col =
+            TableColumn::new_time_column(id_generator.next_id() as ColumnId, unit.clone());
         // Append time column at the start
         schema.push(time_col);
 
         for column_opt in columns {
             let col_id = id_generator.next_id() as ColumnId;
-            let column = Self::column_opt_to_table_column(column_opt, col_id)?;
+            let column = self.column_opt_to_table_column(column_opt, col_id, unit.clone())?;
             schema.push(column);
         }
 
         let mut column_name = HashSet::new();
         for col in schema.iter() {
             if !column_name.insert(col.name.as_str()) {
-                return Err(LogicalPlannerError::Semantic {
-                    err: "Field or Tag name should not have same".to_string(),
+                return Err(QueryError::SameColumnName {
+                    column: col.name.to_string(),
                 });
             }
         }
-        Ok(Plan::DDL(DDLPlan::CreateTable(CreateTable {
+
+        let plan = Plan::DDL(DDLPlan::CreateTable(CreateTable {
             schema,
-            name: normalize_sql_object_name(&name),
+            name: resolved_table,
             if_not_exists,
-        })))
+        }));
+
+        // privilege
+        Ok(PlanWithPrivileges {
+            plan,
+            privileges: vec![Privilege::TenantObject(
+                TenantObjectPrivilege::Database(DatabasePrivilege::Full, Some(database_name)),
+                Some(*session.tenant_id()),
+            )],
+        })
     }
 
-    fn column_opt_to_table_column(column_opt: ColumnOption, id: ColumnId) -> Result<TableColumn> {
+    fn column_opt_to_table_column(
+        &self,
+        column_opt: ColumnOption,
+        id: ColumnId,
+        unit: TimeUnit,
+    ) -> Result<TableColumn> {
         Self::check_column_encoding(&column_opt)?;
 
         let col = if column_opt.is_tag {
             TableColumn::new_tag_column(id, normalize_ident(&column_opt.name))
         } else {
+            let name = normalize_ident(&column_opt.name);
+            let column_type = self.make_data_type(&name, &column_opt.data_type, unit)?;
             TableColumn::new(
                 id,
-                normalize_ident(&column_opt.name),
-                Self::make_data_type(&column_opt.data_type)?,
+                name,
+                column_type,
                 column_opt.encoding.unwrap_or_default(),
             )
         };
         Ok(col)
     }
 
-    fn database_to_describe(&self, statement: DescribeDatabaseOptions) -> Result<Plan> {
-        Ok(Plan::DDL(DDLPlan::DescribeDatabase(DescribeDatabase {
-            database_name: normalize_sql_object_name(&statement.database_name),
-        })))
+    fn database_to_describe(
+        &self,
+        statement: DescribeDatabaseOptions,
+        session: &SessionCtx,
+    ) -> Result<PlanWithPrivileges> {
+        // get the current tenant id from the session
+        let database_name = normalize_sql_object_name(&statement.database_name);
+
+        let plan = Plan::DDL(DDLPlan::DescribeDatabase(DescribeDatabase {
+            database_name: database_name.to_string(),
+        }));
+        // privileges
+        let tenant_id = *session.tenant_id();
+        let privilege = Privilege::TenantObject(
+            TenantObjectPrivilege::Database(DatabasePrivilege::Read, Some(database_name)),
+            Some(tenant_id),
+        );
+        Ok(PlanWithPrivileges {
+            plan,
+            privileges: vec![privilege],
+        })
     }
 
-    fn table_to_describe(&self, opts: DescribeTableOptions) -> Result<Plan> {
-        Ok(Plan::DDL(DDLPlan::DescribeTable(DescribeTable {
-            table_name: normalize_sql_object_name(&opts.table_name),
-        })))
+    fn table_to_describe(
+        &self,
+        opts: DescribeTableOptions,
+        session: &SessionCtx,
+    ) -> Result<PlanWithPrivileges> {
+        let table_name = object_name_to_resolved_table(session, opts.table_name)?;
+        let database_name = table_name.database().to_string();
+
+        let plan = Plan::DDL(DDLPlan::DescribeTable(DescribeTable { table_name }));
+        // privileges
+        Ok(PlanWithPrivileges {
+            plan,
+            privileges: vec![Privilege::TenantObject(
+                TenantObjectPrivilege::Database(DatabasePrivilege::Read, Some(database_name)),
+                Some(*session.tenant_id()),
+            )],
+        })
     }
 
-    fn table_to_alter(&self, statement: ASTAlterTable) -> Result<Plan> {
-        let table_name = normalize_sql_object_name(&statement.table_name);
-        let table_provider = self.get_table_provider(&table_name)?;
-        let table_schema = table_provider
-            .as_any()
-            .downcast_ref::<ClusterTable>()
-            .ok_or_else(|| MetadataError::TableIsNotTsKv {
-                table_name: table_name.to_string(),
-            })
-            .context(MetadataSnafu)?
-            .table_schema();
+    fn table_to_alter(
+        &self,
+        statement: ASTAlterTable,
+        session: &SessionCtx,
+    ) -> Result<PlanWithPrivileges> {
+        let table_name = object_name_to_resolved_table(session, statement.table_name)?;
+        let table_schema = self.get_tskv_schema(&table_name)?;
+
+        let time_unit = if let ColumnType::Time(ref unit) = table_schema
+            .column(TIME_FIELD)
+            .ok_or(QueryError::CommonError {
+                msg: "schema missing time column".to_string(),
+            })?
+            .column_type
+        {
+            unit.clone()
+        } else {
+            return Err(QueryError::CommonError {
+                msg: "time column type not match".to_string(),
+            });
+        };
 
         let alter_action = match statement.alter_action {
             ASTAlterTableAction::AddColumn { column } => {
-                let table_column = Self::column_opt_to_table_column(column, ColumnId::default())?;
+                let mut table_column =
+                    self.column_opt_to_table_column(column, ColumnId::default(), time_unit)?;
                 if table_schema.contains_column(&table_column.name) {
-                    return Err(LogicalPlannerError::Semantic {
-                        err: format!(
-                            "column {} already exists in table {}",
-                            &table_column.name, table_schema.name
-                        ),
+                    return Err(QueryError::ColumnAlreadyExists {
+                        table: table_schema.name.to_string(),
+                        column: table_column.name,
                     });
                 }
+                table_column.id = table_schema.next_column_id();
                 AlterTableAction::AddColumn { table_column }
             }
             ASTAlterTableAction::DropColumn { ref column_name } => {
                 let column_name = normalize_ident(column_name);
                 let table_column = table_schema.column(&column_name).ok_or_else(|| {
-                    LogicalPlannerError::Semantic {
-                        err: format!(
-                            "column {} not exists in table {}",
-                            &table_schema.name, column_name
-                        ),
+                    QueryError::ColumnNotExists {
+                        column: column_name.to_string(),
+                        table: table_schema.name.to_string(),
                     }
                 })?;
 
                 if table_column.column_type.is_tag() {
-                    return Err(LogicalPlannerError::Semantic {
-                        err: "can't drop tag".to_string(),
+                    return Err(QueryError::DropTag {
+                        column: table_column.name.to_string(),
                     });
                 }
 
                 if table_column.column_type.is_field() && table_schema.field_num() == 1 {
-                    return Err(LogicalPlannerError::Semantic {
-                        err: "table must hava a field".to_string(),
-                    });
+                    return Err(QueryError::AtLeastOneField);
                 }
 
                 if table_column.column_type.is_time() {
-                    return Err(LogicalPlannerError::Semantic {
-                        err: format!("can't drop {} column", TIME_FIELD_NAME),
-                    });
+                    return Err(QueryError::AtLeastOneTag);
                 }
 
                 AlterTableAction::DropColumn { column_name }
@@ -409,24 +725,19 @@ impl<S: ContextProvider> SqlPlaner<S> {
             } => {
                 let column_name = normalize_ident(column_name);
                 let column = table_schema.column(&column_name).ok_or_else(|| {
-                    LogicalPlannerError::Semantic {
-                        err: format!(
-                            "column {} not exists in table {}",
-                            column_name, &table_schema.name
-                        ),
+                    QueryError::ColumnNotExists {
+                        column: column_name.to_string(),
+                        table: table_schema.name.to_string(),
                     }
                 })?;
                 if column.column_type.is_tag() {
-                    return Err(LogicalPlannerError::Semantic {
-                        err: "tag does not support compression".to_string(),
-                    });
+                    return Err(QueryError::TagNotSupportCompression);
                 }
 
                 if column.column_type.is_time() {
-                    return Err(LogicalPlannerError::Semantic {
-                        err: format!("can't modify codec type of {} column", TIME_FIELD_NAME),
-                    });
+                    return Err(QueryError::TimeColumnAlter);
                 }
+
                 let mut new_column = column.clone();
                 new_column.encoding = encoding;
 
@@ -436,43 +747,311 @@ impl<S: ContextProvider> SqlPlaner<S> {
                 }
             }
         };
-        Ok(Plan::DDL(DDLPlan::AlterTable(AlterTable {
+        let plan = Plan::DDL(DDLPlan::AlterTable(AlterTable {
             table_name,
             alter_action,
-        })))
+        }));
+
+        // privileges
+        Ok(PlanWithPrivileges {
+            plan,
+            privileges: vec![Privilege::TenantObject(
+                TenantObjectPrivilege::Database(
+                    DatabasePrivilege::Full,
+                    Some(table_schema.db.clone()),
+                ),
+                Some(*session.tenant_id()),
+            )],
+        })
     }
 
-    fn database_to_show(&self) -> Result<Plan> {
-        Ok(Plan::DDL(DDLPlan::ShowDatabases()))
+    fn database_to_show(&self, session: &SessionCtx) -> Result<PlanWithPrivileges> {
+        let plan = Plan::DDL(DDLPlan::ShowDatabases());
+        // privileges
+        let tenant_id = *session.tenant_id();
+        let privilege = Privilege::TenantObject(
+            TenantObjectPrivilege::Database(DatabasePrivilege::Read, None),
+            Some(tenant_id),
+        );
+        Ok(PlanWithPrivileges {
+            plan,
+            privileges: vec![privilege],
+        })
     }
 
-    fn table_to_show(&self, database: Option<ObjectName>) -> Result<Plan> {
-        Ok(Plan::DDL(DDLPlan::ShowTables(
-            database.map(|db_name| normalize_sql_object_name(&db_name)),
-        )))
+    fn table_to_show(
+        &self,
+        database: Option<ObjectName>,
+        session: &SessionCtx,
+    ) -> Result<PlanWithPrivileges> {
+        let db_name = database.map(|db_name| normalize_sql_object_name(&db_name));
+        let plan = Plan::DDL(DDLPlan::ShowTables(db_name.clone()));
+        // privileges
+        Ok(PlanWithPrivileges {
+            plan,
+            privileges: vec![Privilege::TenantObject(
+                TenantObjectPrivilege::Database(DatabasePrivilege::Read, db_name),
+                Some(*session.tenant_id()),
+            )],
+        })
     }
 
-    fn database_to_plan(&self, stmt: ASTCreateDatabase) -> Result<Plan> {
+    fn show_tag_body(
+        &self,
+        session: &SessionCtx,
+        body: ShowTagBody,
+        projection_function: impl FnOnce(
+            &TskvTableSchema,
+            LogicalPlanBuilder,
+            bool,
+        ) -> Result<LogicalPlan>,
+    ) -> Result<PlanWithPrivileges> {
+        // merge db a.b table b.c to a.b.c
+        let table = match merge_object_name(body.database_name.clone(), Some(body.table.clone())) {
+            Some(table) => table,
+            None => {
+                return Err(QueryError::DBTableConflict {
+                    db: body.database_name.unwrap_or(ObjectName(vec![])).to_string(),
+                    table: body.table.to_string(),
+                });
+            }
+        };
+
+        let table_name = object_name_to_resolved_table(session, table)?;
+        let table_source = self.get_table_source(&table_name)?;
+        let table_schema = self.get_tskv_schema(&table_name)?;
+        let table_df_schema = table_source.schema().to_dfschema_ref()?;
+
+        // build from
+        let mut plan_builder =
+            LogicalPlanBuilder::scan(&table_schema.name, table_source.clone(), None)?;
+
+        // build where
+        let selection = match body.selection {
+            Some(expr) => Some(self.df_planner.sql_to_expr(
+                expr,
+                &table_df_schema,
+                &mut Default::default(),
+            )?),
+            None => None,
+        };
+
+        // get all columns in expr
+        let mut columns = HashSet::new();
+        if let Some(selection) = &selection {
+            expr_to_columns(selection, &mut columns)?;
+        }
+
+        // check column
+        check_show_series_expr(&columns, &table_schema)?;
+
+        if let Some(selection) = selection {
+            plan_builder = plan_builder.filter(selection)?;
+        }
+
+        // get where has time column
+        let where_contain_time = columns
+            .iter()
+            .flat_map(|c: &Column| table_schema.column(&c.name))
+            .any(|c: &TableColumn| c.column_type.is_time());
+
+        // build projection
+        let plan = projection_function(&table_schema, plan_builder, where_contain_time)?;
+
+        // build order by
+        let mut plan_builder = self.order_by(body.order_by, plan)?;
+
+        // build limit
+        if body.limit.is_some() || body.offset.is_some() {
+            plan_builder =
+                self.limit_offset_to_plan(body.limit, body.offset, plan_builder, &table_df_schema)?;
+        }
+
+        let df_plan = plan_builder.build()?;
+        let db_name = &table_schema.db;
+
+        Ok(PlanWithPrivileges {
+            plan: Plan::Query(QueryPlan { df_plan }),
+            privileges: vec![Privilege::TenantObject(
+                TenantObjectPrivilege::Database(DatabasePrivilege::Read, Some(db_name.to_string())),
+                Some(*session.tenant_id()),
+            )],
+        })
+    }
+
+    fn show_series_to_plan(
+        &self,
+        stmt: ASTShowSeries,
+        session: &SessionCtx,
+    ) -> Result<PlanWithPrivileges> {
+        self.show_tag_body(session, stmt.body, show_series_projection)
+    }
+
+    fn show_tag_values(
+        &self,
+        stmt: ASTShowTagValues,
+        session: &SessionCtx,
+    ) -> Result<PlanWithPrivileges> {
+        // merge db a.b table b.c to a.b.c
+        self.show_tag_body(
+            session,
+            stmt.body,
+            |schema, plan_builder, where_contain_time| {
+                show_tag_value_projections(schema, plan_builder, where_contain_time, stmt.with)
+            },
+        )
+    }
+
+    fn database_to_plan(
+        &self,
+        stmt: ASTCreateDatabase,
+        session: &SessionCtx,
+    ) -> Result<PlanWithPrivileges> {
         let ASTCreateDatabase {
             name,
             if_not_exists,
             options,
         } = stmt;
+
+        let name = normalize_sql_object_name(&name);
+
+        // check if system database
+        if name.eq_ignore_ascii_case(CLUSTER_SCHEMA)
+            || name.eq_ignore_ascii_case(INFORMATION_SCHEMA)
+        {
+            return Err(QueryError::Meta {
+                source: MetaError::DatabaseAlreadyExists { database: name },
+            });
+        }
+
         let options = self.make_database_option(options)?;
-        Ok(Plan::DDL(DDLPlan::CreateDatabase(CreateDatabase {
-            name: normalize_sql_object_name(&name),
+        let plan = Plan::DDL(DDLPlan::CreateDatabase(CreateDatabase {
+            name,
             if_not_exists,
             options,
-        })))
+        }));
+        // privileges
+        let tenant_id = *session.tenant_id();
+        let privilege = Privilege::TenantObject(
+            TenantObjectPrivilege::Database(DatabasePrivilege::Write, None),
+            Some(tenant_id),
+        );
+        Ok(PlanWithPrivileges {
+            plan,
+            privileges: vec![privilege],
+        })
     }
 
-    fn database_to_alter(&self, stmt: ASTAlterDatabase) -> Result<Plan> {
+    fn order_by(&self, exprs: Vec<OrderByExpr>, plan: LogicalPlan) -> Result<LogicalPlanBuilder> {
+        if exprs.is_empty() {
+            return Ok(LogicalPlanBuilder::from(plan));
+        }
+        let schema = plan.schema();
+
+        let mut sort_exprs = Vec::new();
+        for OrderByExpr {
+            expr,
+            asc,
+            nulls_first,
+        } in exprs
+        {
+            let expr = self
+                .df_planner
+                .sql_to_expr(expr, schema, &mut Default::default())?;
+            let asc = asc.unwrap_or(true);
+            let sort_expr = Expr::Sort(Sort {
+                expr: Box::new(expr),
+                asc,
+                // when asc is true, by default nulls last to be consistent with postgres
+                // postgres rule: https://www.postgresql.org/docs/current/queries-order.html
+                nulls_first: nulls_first.unwrap_or(!asc),
+            });
+            sort_exprs.push(sort_expr);
+        }
+
+        Ok(LogicalPlanBuilder::from(plan).sort(sort_exprs)?)
+    }
+
+    fn limit_offset_to_plan(
+        &self,
+        limit: Option<ASTExpr>,
+        offset: Option<Offset>,
+        plan_builder: LogicalPlanBuilder,
+        schema: &DFSchema,
+    ) -> Result<LogicalPlanBuilder> {
+        let skip = match offset {
+            Some(offset) => {
+                match self
+                    .df_planner
+                    .sql_to_expr(offset.value, schema, &mut Default::default())?
+                {
+                    Expr::Literal(ScalarValue::Int64(Some(m))) => {
+                        if m < 0 {
+                            return Err(QueryError::Semantic {
+                                err: format!("OFFSET must be >= 0, '{}' was provided.", m),
+                            });
+                        } else {
+                            m as usize
+                        }
+                    }
+                    _ => {
+                        return Err(QueryError::Semantic {
+                            err: "The OFFSET clause must be a constant of BIGINT type".to_string(),
+                        });
+                    }
+                }
+            }
+            None => 0,
+        };
+
+        let fetch = match limit {
+            Some(exp) => match self
+                .df_planner
+                .sql_to_expr(exp, schema, &mut Default::default())?
+            {
+                Expr::Literal(ScalarValue::Int64(Some(n))) => {
+                    if n < 0 {
+                        return Err(QueryError::LimitBtZero { provide: n });
+                    } else {
+                        Some(n as usize)
+                    }
+                }
+                _ => return Err(QueryError::LimitConstant),
+            },
+            None => None,
+        };
+
+        let plan_builder = plan_builder.limit(skip, fetch)?;
+        Ok(plan_builder)
+    }
+
+    fn database_to_alter(
+        &self,
+        stmt: ASTAlterDatabase,
+        session: &SessionCtx,
+    ) -> Result<PlanWithPrivileges> {
         let ASTAlterDatabase { name, options } = stmt;
         let options = self.make_database_option(options)?;
-        Ok(Plan::DDL(DDLPlan::AlterDatabase(AlterDatabase {
-            database_name: normalize_sql_object_name(&name),
+        if options.precision().is_some() {
+            return Err(QueryError::Semantic {
+                err: "Can not alter database precision".to_string(),
+            });
+        }
+        let database_name = normalize_sql_object_name(&name);
+        let plan = Plan::DDL(DDLPlan::AlterDatabase(AlterDatabase {
+            database_name: database_name.to_string(),
             database_options: options,
-        })))
+        }));
+        // privileges
+        let tenant_id = *session.tenant_id();
+        let privilege = Privilege::TenantObject(
+            TenantObjectPrivilege::Database(DatabasePrivilege::Full, Some(database_name)),
+            Some(tenant_id),
+        );
+        Ok(PlanWithPrivileges {
+            plan,
+            privileges: vec![privilege],
+        })
     }
 
     fn make_database_option(&self, options: ASTDatabaseOptions) -> Result<DatabaseOptions> {
@@ -490,44 +1069,42 @@ impl<S: ContextProvider> SqlPlaner<S> {
             plan_options.with_vnode_duration(self.str_to_duration(&vnode_duration)?);
         }
         if let Some(precision) = options.precision {
-            plan_options.with_precision(Precision::new(&precision).ok_or(
-                LogicalPlannerError::Semantic {
-                    err: format!(
-                        "{} is not a valid precision, use like 'ms', 'us', 'ns'",
-                        precision
-                    ),
-                },
-            )?);
+            plan_options.with_precision(Precision::new(&precision).ok_or(QueryError::Parser {
+                source: ParserError::ParserError(format!(
+                    "{} is not a valid precision, use like 'ms', 'us', 'ns'",
+                    precision
+                )),
+            })?);
         }
         Ok(plan_options)
     }
 
     fn str_to_duration(&self, text: &str) -> Result<Duration> {
-        let duration = match Duration::new(text) {
-            None => {
-                return Err(LogicalPlannerError::Semantic {
-                    err: format!(
-                        "{} is not a valid precision, use like 'ms', 'us', 'ns'",
-                        text
-                    ),
-                })
-            }
-            Some(v) => v,
-        };
-        Ok(duration)
+        Duration::new(text).ok_or_else(|| QueryError::Parser {
+            source: ParserError::ParserError(format!(
+                "{} is not a valid precision, use like 'ms', 'us', 'ns'",
+                text
+            )),
+        })
     }
 
-    fn make_data_type(data_type: &SQLDataType) -> Result<ColumnType> {
+    fn make_data_type(
+        &self,
+        column_name: &str,
+        data_type: &SQLDataType,
+        time_unit: TimeUnit,
+    ) -> Result<ColumnType> {
         match data_type {
             // todo : should support get time unit for database
-            SQLDataType::Timestamp(_) => Ok(ColumnType::Time),
+            SQLDataType::Timestamp(_, TimezoneInfo::None) => Ok(ColumnType::Time(time_unit)),
             SQLDataType::BigInt(_) => Ok(ColumnType::Field(ValueType::Integer)),
             SQLDataType::UnsignedBigInt(_) => Ok(ColumnType::Field(ValueType::Unsigned)),
             SQLDataType::Double => Ok(ColumnType::Field(ValueType::Float)),
             SQLDataType::String => Ok(ColumnType::Field(ValueType::String)),
             SQLDataType::Boolean => Ok(ColumnType::Field(ValueType::Boolean)),
-            _ => Err(LogicalPlannerError::Semantic {
-                err: format!("Unexpected data type {}", data_type),
+            _ => Err(QueryError::DataType {
+                column: column_name.to_string(),
+                data_type: data_type.to_string(),
             }),
         }
     }
@@ -540,7 +1117,7 @@ impl<S: ContextProvider> SqlPlaner<S> {
         // 数据类型 -> 压缩方式 校验
         let encoding = column.encoding.unwrap_or_default();
         let is_ok = match column.data_type {
-            SQLDataType::Timestamp(_) => encoding.is_timestamp_encoding(),
+            SQLDataType::Timestamp(_, _) => encoding.is_timestamp_encoding(),
             SQLDataType::BigInt(_) => encoding.is_bigint_encoding(),
             SQLDataType::UnsignedBigInt(_) => encoding.is_unsigned_encoding(),
             SQLDataType::Double => encoding.is_double_encoding(),
@@ -549,164 +1126,1133 @@ impl<S: ContextProvider> SqlPlaner<S> {
             _ => false,
         };
         if !is_ok {
-            return Err(LogicalPlannerError::Semantic {
-                err: format!(
-                    "Unsupported encoding type {:?} for {}",
-                    column.encoding, column.data_type
-                ),
+            return Err(QueryError::EncodingType {
+                encoding_type: column.encoding.unwrap_or_default(),
+                data_type: column.data_type.to_string(),
             });
         }
         Ok(())
     }
 
-    fn extract_column_names(
+    fn get_db_precision(&self, name: &str) -> Result<Precision> {
+        let precision = self.schema_provider.get_db_precision(name)?;
+        Ok(precision)
+    }
+
+    fn get_table_source(&self, table_name: &ResolvedTable) -> Result<Arc<dyn TableSource>> {
+        Ok(self.schema_provider.get_table_source(table_name.into())?)
+    }
+
+    fn create_tenant_to_plan(&self, stmt: ast::CreateTenant) -> Result<PlanWithPrivileges> {
+        let ast::CreateTenant {
+            name,
+            if_not_exists,
+            with_options,
+        } = stmt;
+
+        let name = normalize_ident(&name);
+        let options = sql_options_to_tenant_options(with_options)?;
+
+        let privileges = vec![Privilege::Global(GlobalPrivilege::Tenant(None))];
+
+        let plan = Plan::DDL(DDLPlan::CreateTenant(Box::new(CreateTenant {
+            name,
+            if_not_exists,
+            options,
+        })));
+
+        Ok(PlanWithPrivileges { plan, privileges })
+    }
+
+    fn create_user_to_plan(&self, stmt: ast::CreateUser) -> Result<PlanWithPrivileges> {
+        let ast::CreateUser {
+            name,
+            if_not_exists,
+            with_options,
+        } = stmt;
+
+        let name = normalize_ident(&name);
+        let options = sql_options_to_user_options(with_options)?;
+
+        let privileges = vec![Privilege::Global(GlobalPrivilege::User(None))];
+
+        let plan = Plan::DDL(DDLPlan::CreateUser(CreateUser {
+            name,
+            if_not_exists,
+            options,
+        }));
+
+        Ok(PlanWithPrivileges { plan, privileges })
+    }
+
+    fn create_role_to_plan(
         &self,
-        columns: &[String],
-        target_table_source_ref: Arc<dyn TableSource>,
-    ) -> Vec<String> {
-        if columns.is_empty() {
-            target_table_source_ref
-                .schema()
-                .fields()
-                .iter()
-                .map(|e| e.name().clone())
-                .collect()
-        } else {
-            columns.to_vec()
+        stmt: ast::CreateRole,
+        session: &SessionCtx,
+    ) -> Result<PlanWithPrivileges> {
+        let ast::CreateRole {
+            name,
+            if_not_exists,
+            inherit,
+        } = stmt;
+
+        let role_name = normalize_ident(&name);
+        let tenant_name = session.tenant();
+        let tenant_id = *session.tenant_id();
+
+        let inherit_tenant_role = inherit
+            .map(|ref e| {
+                SystemTenantRole::try_from(normalize_ident(e).as_str())
+                    .map_err(|err| QueryError::Semantic { err })
+            })
+            .unwrap_or(Ok(SystemTenantRole::Member))?;
+
+        let privilege = Privilege::TenantObject(TenantObjectPrivilege::RoleFull, Some(tenant_id));
+
+        let plan = Plan::DDL(DDLPlan::CreateRole(CreateRole {
+            tenant_name: tenant_name.to_string(),
+            name: role_name,
+            if_not_exists,
+            inherit_tenant_role,
+        }));
+
+        Ok(PlanWithPrivileges {
+            plan,
+            privileges: vec![privilege],
+        })
+    }
+
+    async fn construct_alter_tenant_action_with_privilege(
+        &self,
+        tenant: Tenant,
+        operation: AlterTenantOperation,
+    ) -> Result<(AlterTenantAction, Privilege<Oid>)> {
+        let alter_tenant_action_with_privileges = match operation {
+            AlterTenantOperation::AddUser(ref user, ref role) => {
+                // user_id: Oid,
+                // role: TenantRole<Oid>,
+                // tenant_id: Oid,
+                let privilege =
+                    Privilege::TenantObject(TenantObjectPrivilege::MemberFull, Some(*tenant.id()));
+
+                let user_name = normalize_ident(user);
+                // 查询用户信息，不存在直接报错咯
+                // fn user(
+                //     &self,
+                //     name: &str
+                // ) -> Result<Option<UserDesc>>;
+                let user_desc = self.schema_provider.get_user(&user_name).await?;
+                let user_id = *user_desc.id();
+
+                let role_name = normalize_ident(role);
+                let role = SystemTenantRole::try_from(role_name.as_str())
+                    .ok()
+                    .map(TenantRoleIdentifier::System)
+                    .unwrap_or_else(|| TenantRoleIdentifier::Custom(role_name));
+
+                (
+                    AlterTenantAction::AddUser(AlterTenantAddUser { user_id, role }),
+                    privilege,
+                )
+            }
+            AlterTenantOperation::SetUser(ref user, ref role) => {
+                // user_id: Oid,
+                // role: TenantRole<Oid>,
+                // tenant_id: Oid,
+                let privilege =
+                    Privilege::TenantObject(TenantObjectPrivilege::MemberFull, Some(*tenant.id()));
+
+                let user_name = normalize_ident(user);
+                // 查询用户信息，不存在直接报错咯
+                // fn user(
+                //     &self,
+                //     name: &str
+                // ) -> Result<Option<UserDesc>>;
+                let user_desc = self.schema_provider.get_user(&user_name).await?;
+                let user_id = *user_desc.id();
+
+                let role_name = normalize_ident(role);
+                let role = SystemTenantRole::try_from(role_name.as_str())
+                    .ok()
+                    .map(TenantRoleIdentifier::System)
+                    .unwrap_or_else(|| TenantRoleIdentifier::Custom(role_name));
+
+                (
+                    AlterTenantAction::SetUser(AlterTenantSetUser { user_id, role }),
+                    privilege,
+                )
+            }
+            AlterTenantOperation::RemoveUser(ref user) => {
+                // user_id: Oid,
+                // tenant_id: Oid
+                let privilege =
+                    Privilege::TenantObject(TenantObjectPrivilege::MemberFull, Some(*tenant.id()));
+
+                let user_name = normalize_ident(user);
+                // 查询用户信息，不存在直接报错咯
+                // fn user(
+                //     &self,
+                //     name: &str
+                // ) -> Result<Option<UserDesc>>;
+                let user_desc = self.schema_provider.get_user(&user_name).await?;
+                let user_id = *user_desc.id();
+
+                (AlterTenantAction::RemoveUser(user_id), privilege)
+            }
+            AlterTenantOperation::Set(sql_option) => {
+                sql_option_to_alter_tenant_action(tenant, sql_option)?
+            }
+            AlterTenantOperation::UnSet(ident) => {
+                unset_option_to_alter_tenant_action(tenant, ident)?
+            }
+        };
+
+        Ok(alter_tenant_action_with_privileges)
+    }
+
+    async fn alter_tenant_to_plan(&self, stmt: ast::AlterTenant) -> Result<PlanWithPrivileges> {
+        let ast::AlterTenant {
+            ref name,
+            operation,
+        } = stmt;
+
+        let tenant_name = normalize_ident(name);
+        // 查询租户信息，不存在直接报错咯
+        // fn tenant(
+        //     &self,
+        //     name: &str
+        // ) -> Result<Tenant>;
+        let tenant = self.schema_provider.get_tenant(&tenant_name).await?;
+
+        let (alter_tenant_action, privilege) = self
+            .construct_alter_tenant_action_with_privilege(tenant, operation)
+            .await?;
+
+        let plan = Plan::DDL(DDLPlan::AlterTenant(AlterTenant {
+            tenant_name,
+            alter_tenant_action,
+        }));
+
+        Ok(PlanWithPrivileges {
+            plan,
+            privileges: vec![privilege],
+        })
+    }
+
+    async fn alter_user_to_plan(&self, stmt: ast::AlterUser) -> Result<PlanWithPrivileges> {
+        let ast::AlterUser { name, operation } = stmt;
+
+        let user_name = normalize_ident(&name);
+        // 查询用户信息，不存在直接报错咯
+        // fn user(
+        //     &self,
+        //     name: &str
+        // ) -> Result<Option<UserDesc>>;
+        let user_desc = self.schema_provider.get_user(&user_name).await?;
+        let user_id = *user_desc.id();
+
+        let alter_user_action = match operation {
+            AlterUserOperation::RenameTo(ref new_name) => {
+                AlterUserAction::RenameTo(normalize_ident(new_name))
+            }
+            AlterUserOperation::Set(sql_option) => {
+                let user_options = sql_options_to_user_options(vec![sql_option])?;
+
+                AlterUserAction::Set(user_options)
+            }
+        };
+
+        let privileges = vec![Privilege::Global(GlobalPrivilege::User(Some(user_id)))];
+
+        let plan = Plan::DDL(DDLPlan::AlterUser(AlterUser {
+            user_name,
+            alter_user_action,
+        }));
+
+        Ok(PlanWithPrivileges { plan, privileges })
+    }
+
+    fn grant_revoke_to_plan(
+        &self,
+        stmt: ast::GrantRevoke,
+        session: &SessionCtx,
+    ) -> Result<PlanWithPrivileges> {
+        // database_id: Oid,
+        // privilege: DatabasePrivilege,
+        // role_name: &str,
+        // tenant_id: &Oid,
+        let ast::GrantRevoke {
+            is_grant,
+            privileges,
+            role_name,
+        } = stmt;
+
+        let role_name = normalize_ident(&role_name);
+        let tenant_name = session.tenant();
+        let tenant_id = *session.tenant_id();
+
+        if SystemTenantRole::try_from(role_name.as_str()).is_ok() {
+            let err = QueryError::SystemRoleModification;
+            warn!("{}", err.to_string());
+            return Err(err);
+        }
+
+        let database_privileges = privileges
+            .iter()
+            .map(|ast::Privilege { action, database }| {
+                let database_privilege = match action {
+                    ast::Action::Read => DatabasePrivilege::Read,
+                    ast::Action::Write => DatabasePrivilege::Write,
+                    ast::Action::All => DatabasePrivilege::Full,
+                };
+                let database_name = normalize_ident(database);
+
+                (database_privilege, database_name)
+            })
+            .collect::<Vec<(DatabasePrivilege, String)>>();
+
+        let privileges = vec![Privilege::TenantObject(
+            TenantObjectPrivilege::RoleFull,
+            Some(tenant_id),
+        )];
+
+        let plan = Plan::DDL(DDLPlan::GrantRevoke(GrantRevoke {
+            is_grant,
+            database_privileges,
+            tenant_name: tenant_name.to_string(),
+            role_name,
+        }));
+
+        Ok(PlanWithPrivileges { plan, privileges })
+    }
+
+    fn drop_vnode_to_plan(&self, stmt: ASTDropVnode) -> Result<PlanWithPrivileges> {
+        let ASTDropVnode { vnode_id } = stmt;
+
+        let plan = Plan::DDL(DDLPlan::DropVnode(DropVnode { vnode_id }));
+        Ok(PlanWithPrivileges {
+            plan,
+            privileges: vec![Privilege::Global(GlobalPrivilege::System)],
+        })
+    }
+
+    fn copy_vnode_to_plan(&self, stmt: ASTCopyVnode) -> Result<PlanWithPrivileges> {
+        let ASTCopyVnode { vnode_id, node_id } = stmt;
+
+        let plan = Plan::DDL(DDLPlan::CopyVnode(CopyVnode { vnode_id, node_id }));
+        Ok(PlanWithPrivileges {
+            plan,
+            privileges: vec![Privilege::Global(GlobalPrivilege::System)],
+        })
+    }
+
+    fn move_vnode_to_plan(&self, stmt: ASTMoveVnode) -> Result<PlanWithPrivileges> {
+        let ASTMoveVnode { vnode_id, node_id } = stmt;
+
+        let plan = Plan::DDL(DDLPlan::MoveVnode(MoveVnode { vnode_id, node_id }));
+        Ok(PlanWithPrivileges {
+            plan,
+            privileges: vec![Privilege::Global(GlobalPrivilege::System)],
+        })
+    }
+
+    fn compact_vnode_to_plan(&self, stmt: ASTCompactVnode) -> Result<PlanWithPrivileges> {
+        let ASTCompactVnode { vnode_ids } = stmt;
+
+        let plan = Plan::DDL(DDLPlan::CompactVnode(CompactVnode { vnode_ids }));
+        Ok(PlanWithPrivileges {
+            plan,
+            privileges: vec![Privilege::Global(GlobalPrivilege::System)],
+        })
+    }
+
+    fn checksum_group_to_plan(&self, stmt: ASTChecksumGroup) -> Result<PlanWithPrivileges> {
+        let ASTChecksumGroup { replication_set_id } = stmt;
+
+        let plan = Plan::DDL(DDLPlan::ChecksumGroup(ChecksumGroup { replication_set_id }));
+        Ok(PlanWithPrivileges {
+            plan,
+            privileges: vec![Privilege::Global(GlobalPrivilege::System)],
+        })
+    }
+
+    fn create_stream_table_to_plan(
+        &self,
+        stmt: Statement,
+        session: &SessionCtx,
+    ) -> Result<PlanWithPrivileges> {
+        if let Statement::CreateTable {
+            if_not_exists,
+            name,
+            columns,
+            with_options,
+            engine,
+            ..
+        } = stmt
+        {
+            let stream_type = engine
+                .ok_or_else(|| QueryError::Analyzer {
+                    err: "Engine not found.".to_string(),
+                })?
+                .to_ascii_lowercase();
+
+            let resolved_table = object_name_to_resolved_table(session, name)?;
+            let database_name = resolved_table.database().to_string();
+
+            let extra_options = sql_options_to_map(&with_options);
+
+            let watermark = Watermark {
+                column: get_event_time_column(resolved_table.table(), &extra_options)?.into(),
+                delay: get_watermark_delay(resolved_table.table(), &extra_options)?
+                    .unwrap_or_default(),
+            };
+
+            let schema = self.df_planner.build_schema(columns)?;
+
+            let plan = Plan::DDL(DDLPlan::CreateStreamTable(CreateStreamTable {
+                if_not_exists,
+                name: resolved_table,
+                schema,
+                stream_type,
+                watermark,
+                extra_options,
+            }));
+
+            // privilege
+            return Ok(PlanWithPrivileges {
+                plan,
+                privileges: vec![Privilege::TenantObject(
+                    TenantObjectPrivilege::Database(DatabasePrivilege::Full, Some(database_name)),
+                    Some(*session.tenant_id()),
+                )],
+            });
+        }
+
+        Err(QueryError::Internal {
+            reason: format!("CreateStreamTable: {stmt}"),
+        })
+    }
+
+    fn get_tskv_schema(&self, table_name: &ResolvedTable) -> Result<TskvTableSchemaRef> {
+        let source = self.get_table_source(table_name)?;
+        let adapter = source_downcast_adapter(&source)?;
+        let result = match adapter.table_handle() {
+            TableHandle::Tskv(e) => Ok(e.table_schema()),
+            _ => Err(MetaError::TableNotFound {
+                table: table_name.to_string(),
+            }),
+        };
+
+        Ok(result?)
+    }
+
+    async fn copy_to_plan(
+        &self,
+        stmt: ast::Copy,
+        session: &SessionCtx,
+    ) -> Result<PlanWithPrivileges> {
+        let ast::Copy {
+            copy_target,
+            file_format_options,
+            copy_options,
+        } = stmt;
+
+        let file_format_options = FileFormatOptionsBuilder::default()
+            .apply_options(file_format_options)?
+            .build();
+
+        let copy_options = CopyOptionsBuilder::default()
+            .apply_options(copy_options)?
+            .build();
+
+        let tenant_id = *session.tenant_id();
+
+        match copy_target {
+            CopyTarget::IntoTable(stmt) => {
+                // .   TableWriter
+                //         ListingTable
+                let (external_location_table, target_table, insert_columns) = self
+                    .build_source_and_target_table(session, stmt, file_format_options, copy_options)
+                    .await?;
+
+                let plan = build_copy_into_table_plan(
+                    external_location_table,
+                    target_table.clone(),
+                    insert_columns.as_ref(),
+                )?;
+
+                Ok(PlanWithPrivileges {
+                    plan,
+                    privileges: vec![Privilege::TenantObject(
+                        TenantObjectPrivilege::Database(
+                            DatabasePrivilege::Write,
+                            Some(target_table.database_name().into()),
+                        ),
+                        Some(tenant_id),
+                    )],
+                })
+            }
+            CopyTarget::IntoLocation(stmt) => {
+                // .   TableWriterPlanNode
+                //         Plan.....
+                let plan = self
+                    .copy_into_location(session, stmt, file_format_options)
+                    .await?;
+
+                let database_set = self.schema_provider.reset_access_databases();
+                let privileges =
+                    databases_privileges(DatabasePrivilege::Read, tenant_id, database_set);
+                Ok(PlanWithPrivileges { plan, privileges })
+            }
         }
     }
 
-    fn get_table_source(&self, table_name: &str) -> Result<Arc<dyn TableSource>> {
-        let table_ref = TableReference::from(table_name);
-        self.schema_provider
-            .get_table_provider(table_ref)
-            .context(logical_planner::ExternalSnafu)
+    /// Construct an external file as an external table
+    ///
+    /// Get target table‘s metadata and insert columns
+    async fn build_source_and_target_table(
+        &self,
+        session: &SessionCtx,
+        stmt: CopyIntoTable,
+        file_format_options: FileFormatOptions,
+        copy_options: CopyOptions,
+    ) -> Result<(Arc<dyn TableSource>, Arc<TableSourceAdapter>, Vec<String>)> {
+        let CopyIntoTable {
+            location,
+            ref table_name,
+            columns,
+        } = stmt;
+
+        let UriLocation {
+            path,
+            connection_options,
+        } = location;
+
+        let CopyOptions { auto_infer_schema } = copy_options;
+
+        let table_path = ListingTableUrl::parse(path)?;
+        let insert_columns = columns.iter().map(normalize_ident).collect::<Vec<_>>();
+
+        // 1. Build and register object store
+        build_and_register_object_store(
+            &table_path,
+            connection_options,
+            session.inner().runtime_env(),
+        )?;
+
+        // 2. Get the metadata of the target table
+        let table_name = normalize_sql_object_name(table_name);
+        let target_table_source = self
+            .schema_provider
+            .get_table_source(TableReference::from(table_name.as_str()))?;
+
+        // 3. According to the external path, construct the external table
+        let default_schema = if auto_infer_schema {
+            None
+        } else {
+            let schema = target_table_source.schema();
+            if insert_columns.is_empty() {
+                // Use the schema of the insert table directly
+                Some(schema)
+            } else {
+                // projection with specific columns
+                // e.g. COPY INTO inner_csv_v2(time, tag1, tag2, bigint_c, string_c, ubigint_c, boolean_c, double_c)
+                let indices = insert_columns
+                    .iter()
+                    .map(|e| schema.index_of(e))
+                    .collect::<std::result::Result<Vec<usize>, ArrowError>>()?;
+                Some(Arc::new(schema.project(&indices)?))
+            }
+        };
+        let external_location_table_source = build_external_location_table_source(
+            session,
+            table_path,
+            default_schema,
+            file_format_options,
+            session.inner().copied_config(),
+        )
+        .await?;
+
+        Ok((
+            external_location_table_source,
+            target_table_source,
+            insert_columns,
+        ))
     }
 
-    fn get_table_provider(&self, table_name: &str) -> Result<Arc<dyn TableProvider>> {
-        let table_source = self.get_table_source(table_name)?;
-        source_as_provider(&table_source)
-            .map_err(|_| MetadataError::InvalidSchema {
-                error_msg: format!(
-                    "can't convert table source {} to table provider ",
-                    table_name
-                ),
-            })
-            .context(MetadataSnafu)
+    async fn copy_into_location(
+        &self,
+        session: &SessionCtx,
+        stmt: ast::CopyIntoLocation,
+        file_format_options: FileFormatOptions,
+    ) -> Result<Plan> {
+        let ast::CopyIntoLocation { from, location } = stmt;
+        let UriLocation {
+            path,
+            connection_options,
+        } = location;
+
+        let table_path = ListingTableUrl::parse(path)?;
+
+        // 1. Build and register object store
+        build_and_register_object_store(
+            &table_path,
+            connection_options,
+            session.inner().runtime_env(),
+        )?;
+
+        // 2. build source plan
+        let source_plan = self.create_relation(from, &mut Default::default())?;
+        let source_schem = SchemaRef::new(source_plan.schema().deref().into());
+
+        // 3. According to the external path, construct the external table
+        let target_table = build_external_location_table_source(
+            session,
+            table_path,
+            Some(source_schem),
+            file_format_options,
+            session.inner().copied_config(),
+        )
+        .await?;
+
+        // 4. build final plan
+        let df_plan = LogicalPlanBuilder::from(source_plan)
+            .write(target_table, TEMP_LOCATION_TABLE_NAME, Default::default())?
+            .build()?;
+
+        Ok(Plan::Query(QueryPlan { df_plan }))
+    }
+
+    fn create_relation(
+        &self,
+        relation: TableFactor,
+        ctes: &mut HashMap<String, LogicalPlan>,
+    ) -> DFResult<LogicalPlan> {
+        let (plan, alias) = match relation {
+            TableFactor::Table {
+                name: ref sql_object_name,
+                alias,
+                ..
+            } => {
+                // normalize name and alias
+                let table_name = normalize_sql_object_name(sql_object_name);
+                let table_ref: TableReference = table_name.as_str().into();
+                let cte = ctes.get(&table_name);
+                (
+                    match (cte, self.schema_provider.get_table_provider(table_ref)) {
+                        (Some(cte_plan), _) => Ok(cte_plan.clone()),
+                        (_, Ok(provider)) => {
+                            LogicalPlanBuilder::scan(&table_name, provider, None)?.build()
+                        }
+                        (None, Err(e)) => Err(e),
+                    }?,
+                    alias,
+                )
+            }
+            TableFactor::Derived {
+                subquery, alias, ..
+            } => {
+                let logical_plan = self
+                    .df_planner
+                    .sql_statement_to_plan(Statement::Query(subquery))?;
+                (logical_plan, alias)
+            }
+            // @todo Support TableFactory::TableFunction?
+            _ => {
+                return Err(DataFusionError::NotImplemented(format!(
+                    "Unsupported ast node {:?} in create_relation",
+                    relation
+                )));
+            }
+        };
+        if let Some(alias) = alias {
+            self.apply_table_alias(plan, alias)
+        } else {
+            Ok(plan)
+        }
+    }
+
+    /// Apply the given TableAlias to the top-level projection.
+    fn apply_table_alias(&self, plan: LogicalPlan, alias: TableAlias) -> DFResult<LogicalPlan> {
+        let apply_name_plan =
+            LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(plan, normalize_ident(&alias.name))?);
+
+        self.apply_expr_alias(apply_name_plan, alias.columns)
+    }
+
+    fn apply_expr_alias(&self, plan: LogicalPlan, idents: Vec<Ident>) -> DFResult<LogicalPlan> {
+        if idents.is_empty() {
+            Ok(plan)
+        } else if idents.len() != plan.schema().fields().len() {
+            Err(DataFusionError::Plan(format!(
+                "Source table contains {} columns but only {} names given as column alias",
+                plan.schema().fields().len(),
+                idents.len(),
+            )))
+        } else {
+            let fields = plan.schema().fields().clone();
+            LogicalPlanBuilder::from(plan)
+                .project(
+                    fields
+                        .iter()
+                        .zip(idents.into_iter())
+                        .map(|(field, ident)| col(field.name()).alias(normalize_ident(&ident))),
+                )?
+                .build()
+        }
     }
 }
 
-fn semantic_check(
+fn build_copy_into_table_plan(
+    external_location_table: Arc<dyn TableSource>,
+    target_table: Arc<TableSourceAdapter>,
     insert_columns: &[String],
-    source_plan: &LogicalPlan,
-    target_table: Arc<dyn TableSource>,
+) -> DFResult<Plan> {
+    let df_plan =
+        LogicalPlanBuilder::scan(TEMP_LOCATION_TABLE_NAME, external_location_table, None)?
+            .write(
+                target_table.clone(),
+                target_table.table_name(),
+                insert_columns,
+            )?
+            .build()?;
+
+    debug!("Copy into table plan:\n{}", df_plan.display_indent_schema());
+
+    Ok(Plan::Query(QueryPlan { df_plan }))
+}
+
+fn build_and_register_object_store(
+    table_path: &ListingTableUrl,
+    connection_options: Vec<SqlOption>,
+    runtime_env: Arc<RuntimeEnv>,
 ) -> Result<()> {
-    let target_table_schema = target_table.schema();
-    let target_table_fields = target_table_schema.fields();
+    let url: &Url = table_path.as_ref();
+    let bucket = url.host_str();
+    let schema = table_path.scheme();
 
-    let source_field_num = source_plan.schema().fields().len();
-    let insert_field_num = insert_columns.len();
-    let target_table_field_num = target_table_fields.len();
+    trace::debug!(
+        "Build object store for path: {:?}, bucket: {:?}, options: {:?}",
+        table_path,
+        bucket,
+        connection_options
+    );
 
-    if insert_field_num > source_field_num {
-        return Err(LogicalPlannerError::Semantic {
-            err: MISMATCHED_COLUMNS.to_string(),
-        });
-    }
-
-    if insert_field_num == 0 && source_field_num != target_table_field_num {
-        return Err(LogicalPlannerError::Semantic {
-            err: MISMATCHED_COLUMNS.to_string(),
-        });
-    }
-    // The target table must contain all insert fields
-    for insert_col in insert_columns {
-        target_table_fields
-            .iter()
-            .find(|e| e.name() == insert_col)
-            .ok_or_else(|| LogicalPlannerError::Semantic {
-                err: format!(
-                    "{} {}, expected: {}",
-                    MISSING_COLUMN,
-                    insert_col,
-                    target_table_fields
-                        .iter()
-                        .map(|e| e.name().as_str())
-                        .collect::<Vec<&str>>()
-                        .join(",")
-                ),
-            })?;
+    // local file will not object_store
+    if let Some(object_store) = build_object_store(schema, bucket, connection_options)? {
+        debug!(
+            "Register object store, schema: {}, bucket: {}",
+            schema,
+            bucket.unwrap_or_default()
+        );
+        runtime_env.register_object_store(schema, bucket.unwrap_or_default(), object_store);
     }
 
     Ok(())
 }
 
-fn table_write_plan_node(
-    table_name: String,
-    target_table: Arc<dyn TableSource>,
-    input: LogicalPlan,
-) -> std::result::Result<LogicalPlan, DataFusionError> {
-    // output variable for insert operation
-    let expr = input
-        .schema()
-        .fields()
-        .iter()
-        .last()
-        .map(|e| Expr::Column(e.qualified_column()));
+fn build_object_store(
+    schema: &str,
+    bucket: Option<&str>,
+    connection_options: Vec<SqlOption>,
+) -> Result<Option<Arc<dyn ObjectStore>>> {
+    let uri_schema = UriSchema::from(schema);
+    let parsed_connection_options =
+        parse_connection_options(&uri_schema, bucket, connection_options)?;
 
-    debug_assert!(
-        expr.is_some(),
-        "invalid table write node's input logical plan"
-    );
-
-    let expr = unsafe { expr.unwrap_unchecked() };
-
-    let affected_row_expr = affected_row_expr(expr);
-
-    // construct table writer logical node
-    let node = Arc::new(TableWriterPlanNode::try_new(
-        table_name,
-        target_table,
-        Arc::new(input),
-        vec![affected_row_expr],
-    )?);
-
-    let df_plan = LogicalPlan::Extension(Extension { node });
-
-    let group_expr: Vec<Expr> = vec![];
-
-    LogicalPlanBuilder::from(df_plan)
-        .aggregate(group_expr, vec![merge_affected_row_expr()])?
-        .build()
+    Ok(datasource::build_object_store(parsed_connection_options)?)
 }
 
-impl<S: ContextProvider> LogicalPlanner for SqlPlaner<S> {
-    fn create_logical_plan(
+async fn build_external_location_table_source(
+    ctx: &SessionCtx,
+    table_path: ListingTableUrl,
+    default_schema: Option<SchemaRef>,
+    file_format_options: FileFormatOptions,
+    session_config: SessionConfig,
+) -> datafusion::common::Result<Arc<dyn TableSource>> {
+    let (file_extension, file_format) = build_file_extension_and_format(file_format_options)?;
+    let external_location_table = build_listing_table(
+        &ctx.inner().state(),
+        table_path,
+        default_schema,
+        file_extension,
+        file_format,
+        session_config,
+    )
+    .await?;
+
+    let external_location_table_source = Arc::new(TableSourceAdapter::try_new(
+        *ctx.tenant_id(),
+        ctx.tenant(),
+        "tmp",
+        TEMP_LOCATION_TABLE_NAME,
+        external_location_table,
+    )?);
+
+    Ok(external_location_table_source)
+}
+
+async fn build_listing_table(
+    ctx: &SessionState,
+    table_path: ListingTableUrl,
+    default_schema: Option<SchemaRef>,
+    file_extension: String,
+    file_format: Arc<dyn FileFormat>,
+    session_config: SessionConfig,
+) -> datafusion::common::Result<Arc<ListingTable>> {
+    let options = ListingOptions::new(file_format)
+        .with_collect_stat(session_config.collect_statistics())
+        .with_file_extension(file_extension)
+        .with_target_partitions(session_config.target_partitions());
+
+    let schema = if let Some(schema) = default_schema {
+        schema
+    } else {
+        debug!("Not has default schema, infer schema, path: {}", table_path);
+        options.infer_schema(ctx, &table_path).await?
+    };
+
+    debug!("ListingTable schema: {:?}", schema);
+
+    let config = ListingTableConfig::new(table_path)
+        .with_listing_options(options)
+        // Use the schema of the target table
+        .with_schema(schema);
+
+    Ok(Arc::new(ListingTable::try_new(config)?))
+}
+
+fn build_file_extension_and_format(
+    file_format_options: FileFormatOptions,
+) -> datafusion::common::Result<(String, Arc<dyn FileFormat>)> {
+    let FileFormatOptions {
+        file_type,
+        delimiter,
+        with_header,
+        file_compression_type,
+    } = file_format_options;
+    let file_extension = file_type.get_ext_with_compression(file_compression_type.to_owned())?;
+    let file_format: Arc<dyn FileFormat> = match file_type {
+        FileType::CSV => Arc::new(
+            CsvFormat::default()
+                .with_has_header(with_header)
+                .with_delimiter(delimiter as u8)
+                .with_file_compression_type(file_compression_type),
+        ),
+        FileType::PARQUET => Arc::new(ParquetFormat::default()),
+        FileType::AVRO => Arc::new(AvroFormat::default()),
+        FileType::JSON => {
+            Arc::new(JsonFormat::default().with_file_compression_type(file_compression_type))
+        }
+    };
+
+    Ok((file_extension, file_format))
+}
+
+// check
+// show series can't include field column
+fn check_show_series_expr(columns: &HashSet<Column>, table_schema: &TskvTableSchema) -> Result<()> {
+    for column in columns.iter() {
+        match table_schema.column(&column.name) {
+            Some(table_column) => {
+                if table_column.column_type.is_field() {
+                    return Err(QueryError::ShowSeriesWhereContainsField {
+                        column: column.to_string(),
+                    });
+                }
+            }
+
+            None => {
+                return Err(QueryError::ColumnNotExists {
+                    column: column.to_string(),
+                    table: table_schema.name.to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn show_series_projection(
+    table_schema: &TskvTableSchema,
+    mut plan_builder: LogicalPlanBuilder,
+    where_contain_time: bool,
+) -> Result<LogicalPlan> {
+    let tags = table_schema
+        .columns()
+        .iter()
+        .filter(|c| c.column_type.is_tag())
+        .collect::<Vec<&TableColumn>>();
+
+    // If the time column is included,
+    //   all field columns will be scanned at rewrite_tag_scan,
+    //   so this projection needs to be added
+    if where_contain_time {
+        let exp = tags
+            .iter()
+            .map(|tag| col(Column::new(Some(&table_schema.name), &tag.name)))
+            .collect::<Vec<Expr>>();
+        plan_builder = plan_builder.project(exp)?.distinct()?;
+    };
+
+    // concat tag_key=tag_value projection
+    let tag_concat_expr_iter = tags.iter().map(|tag| {
+        let column_expr = Box::new(Expr::Column(Column::new(
+            Some(&table_schema.name),
+            &tag.name,
+        )));
+        let is_null_expr = Box::new(column_expr.clone().is_null());
+        let when_then_expr = vec![(is_null_expr, Box::new(lit(ScalarValue::Null)))];
+        let else_expr = Some(Box::new(Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(lit(format!("{}=", &tag.name))),
+            op: Operator::StringConcat,
+            right: column_expr,
+        })));
+        Expr::Case(Case::new(None, when_then_expr, else_expr))
+    });
+
+    let concat_ws_args = iter::once(lit(","))
+        .chain(iter::once(lit(&table_schema.name)))
+        .chain(tag_concat_expr_iter)
+        .collect::<Vec<Expr>>();
+    let concat_ws = Expr::ScalarFunction {
+        fun: BuiltinScalarFunction::ConcatWithSeparator,
+        args: concat_ws_args,
+    }
+    .alias("key");
+    Ok(plan_builder.project(iter::once(concat_ws))?.build()?)
+}
+
+fn show_tag_value_projections(
+    table_schema: &TskvTableSchema,
+    mut plan_builder: LogicalPlanBuilder,
+    where_contain_time: bool,
+    with: With,
+) -> Result<LogicalPlan> {
+    let mut tag_key_filter: Box<dyn FnMut(&TableColumn) -> bool> = match with {
+        With::Equal(ident) => Box::new(move |column| normalize_ident(&ident).eq(&column.name)),
+        With::UnEqual(ident) => Box::new(move |column| normalize_ident(&ident).ne(&column.name)),
+        With::In(idents) => Box::new(move |column| {
+            idents
+                .iter()
+                .map(normalize_ident)
+                .any(|name| column.name.eq(&name))
+        }),
+        With::NotIn(idents) => Box::new(move |column| {
+            idents
+                .iter()
+                .map(normalize_ident)
+                .all(|name| column.name.ne(&name))
+        }),
+        _ => {
+            return Err(QueryError::NotImplemented {
+                err: "Not implemented Match, UnMatch".to_string(),
+            });
+        }
+    };
+
+    let tags = table_schema
+        .columns()
+        .iter()
+        .filter(|column| column.column_type.is_tag())
+        .filter(|column| tag_key_filter(column))
+        .collect::<Vec<&TableColumn>>();
+
+    if tags.is_empty() {
+        return Ok(LogicalPlan::EmptyRelation(EmptyRelation {
+            produce_one_row: false,
+            schema: Arc::new(DFSchema::new_with_metadata(
+                vec![
+                    DFField::new(None, "key", DataType::Utf8, false),
+                    DFField::new(None, "value", DataType::Utf8, false),
+                ],
+                HashMap::new(),
+            )?),
+        }));
+    }
+
+    // If the time column is included,
+    //   all field columns will be scanned at rewrite_tag_scan,
+    //   so this projection needs to be added
+    if where_contain_time {
+        let exprs = tags
+            .iter()
+            .map(|tag| col(Column::new(Some(&table_schema.name), &tag.name)))
+            .collect::<Vec<Expr>>();
+
+        plan_builder = plan_builder.project(exprs)?.distinct()?;
+    };
+
+    let mut projections = Vec::new();
+    for tag in tags {
+        let key_column = lit(&tag.name).alias("key");
+        let value_column = col(Column::new(Some(&table_schema.name), &tag.name)).alias("value");
+        let projection = plan_builder
+            .clone()
+            .project(vec![key_column, value_column.clone()])?;
+        let filter_expr = value_column.is_not_null();
+        let projection = projection.filter(filter_expr)?.distinct()?.build()?;
+        projections.push(Arc::new(projection));
+    }
+    let df_schema = projections[0].schema().clone();
+
+    let union = LogicalPlan::Union(Union {
+        inputs: projections,
+        schema: df_schema,
+    });
+    let union_distinct = LogicalPlanBuilder::from(union).distinct()?.build()?;
+
+    Ok(union_distinct)
+}
+
+#[async_trait]
+impl<'a, S: ContextProviderExtension + Send + Sync> LogicalPlanner for SqlPlaner<'a, S> {
+    async fn create_logical_plan(
         &self,
         statement: ExtStatement,
-        _session: &IsiphoSessionCtx,
+        session: &SessionCtx,
     ) -> Result<Plan> {
-        self.statement_to_plan(statement)
+        let PlanWithPrivileges { plan, privileges } =
+            self.statement_to_plan(statement, session).await?;
+        check_privilege(session.user(), privileges)?;
+        Ok(plan)
     }
+}
+
+fn check_privilege(user: &User, privileges: Vec<Privilege<Oid>>) -> Result<()> {
+    let privileges_str = privileges
+        .iter()
+        .map(|e| format!("{:?}", e))
+        .collect::<Vec<String>>()
+        .join(",");
+    debug!("logical_plan's privileges: [{}]", privileges_str);
+
+    for p in privileges.iter() {
+        if !user.check_privilege(p) {
+            return Err(QueryError::InsufficientPrivileges {
+                privilege: format!("{}", p),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn databases_privileges(
+    db_priv: DatabasePrivilege,
+    tenant_id: Oid,
+    databases: DatabaseSet,
+) -> Vec<Privilege<Oid>> {
+    databases
+        .dbs()
+        .into_iter()
+        .cloned()
+        .map(|db| {
+            Privilege::TenantObject(
+                TenantObjectPrivilege::Database(db_priv.clone(), Some(db)),
+                Some(tenant_id),
+            )
+        })
+        .collect()
+}
+
+fn extract_database_table_name(full_name: &str, session: &SessionCtx) -> (String, String) {
+    let table_ref = TableReference::from(full_name);
+    let resloved_table = table_ref.resolve(session.tenant(), session.default_database());
+    let table_name = resloved_table.table.to_string();
+    let database_name = resloved_table.schema.to_string();
+
+    (database_name, table_name)
+}
+
+fn object_name_to_resolved_table(
+    session: &SessionCtx,
+    object_name: ObjectName,
+) -> Result<ResolvedTable> {
+    let table = object_name_to_table_reference(object_name, true)?
+        .as_table_reference()
+        .resolve_object(session.tenant(), session.default_database());
+
+    Ok(table)
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::sql::parser::ExtParser;
-    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-    use datafusion::logical_expr::{Aggregate, AggregateUDF, ScalarUDF, TableSource};
-    use datafusion::sql::planner::ContextProvider;
-    use datafusion::sql::TableReference;
     use std::any::Any;
-    use std::ops::Deref;
     use std::sync::Arc;
 
-    use super::*;
+    use datafusion::arrow::datatypes::TimeUnit::Nanosecond;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::datasource::TableProvider;
     use datafusion::error::Result;
+    use datafusion::execution::memory_pool::UnboundedMemoryPool;
+    use datafusion::logical_expr::logical_plan::AggWithGrouping;
+    use datafusion::logical_expr::{AggregateUDF, Extension, ScalarUDF, TableSource, TableType};
+    use datafusion::physical_plan::ExecutionPlan;
+    use datafusion::sql::planner::ContextProvider;
+    use datafusion::sql::TableReference;
+    use lazy_static::__Deref;
+    use meta::error::MetaError;
+    use models::auth::user::{User, UserDesc, UserOptions};
     use models::codec::Encoding;
+    use models::schema::Tenant;
+    use spi::query::session::SessionCtxFactory;
+    use spi::service::protocol::ContextBuilder;
+
+    use super::*;
+    use crate::data_source::table_source::TableSourceAdapter;
+    use crate::extension::logical::plan_node::table_writer::TableWriterPlanNode;
+    use crate::metadata::ContextProviderExtension;
+    use crate::sql::parser::ExtParser;
 
     #[derive(Debug)]
     struct MockContext {}
+
+    #[async_trait::async_trait]
+    impl ContextProviderExtension for MockContext {
+        async fn get_user(&self, _name: &str) -> std::result::Result<UserDesc, MetaError> {
+            todo!()
+        }
+
+        async fn get_tenant(&self, _name: &str) -> std::result::Result<Tenant, MetaError> {
+            todo!()
+        }
+
+        fn reset_access_databases(&self) -> crate::metadata::DatabaseSet {
+            Default::default()
+        }
+
+        fn get_db_precision(&self, _name: &str) -> std::result::Result<Precision, MetaError> {
+            Ok(Precision::NS)
+        }
+
+        fn get_table_source(
+            &self,
+            name: TableReference,
+        ) -> datafusion::common::Result<Arc<TableSourceAdapter>> {
+            let schema = match name.table() {
+                "test_tb" => Ok(Schema::new(vec![
+                    Field::new("field_int", DataType::Int32, false),
+                    Field::new("field_string", DataType::Utf8, false),
+                ])),
+                _ => {
+                    unimplemented!("use test_tb for test")
+                }
+            };
+            let table = match schema {
+                Ok(tb) => Arc::new(TestTable::new(Arc::new(tb))),
+                Err(e) => return Err(e),
+            };
+
+            Ok(Arc::new(TableSourceAdapter::try_new(
+                Oid::default(),
+                "cnosdb",
+                "public",
+                name.table(),
+                table as Arc<dyn TableProvider>,
+            )?))
+        }
+    }
 
     impl ContextProvider for MockContext {
         fn get_table_provider(&self, name: TableReference) -> Result<Arc<dyn TableSource>> {
@@ -736,7 +2282,12 @@ mod tests {
         fn get_variable_type(&self, _: &[String]) -> Option<DataType> {
             unimplemented!()
         }
+
+        fn options(&self) -> &datafusion::config::ConfigOptions {
+            unimplemented!()
+        }
     }
+
     struct TestTable {
         table_schema: SchemaRef,
     }
@@ -757,26 +2308,68 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_drop() {
+    #[async_trait]
+    impl TableProvider for TestTable {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn schema(&self) -> SchemaRef {
+            self.table_schema.clone()
+        }
+
+        fn table_type(&self) -> TableType {
+            TableType::Base
+        }
+
+        async fn scan(
+            &self,
+            _state: &SessionState,
+            _projection: Option<&Vec<usize>>,
+            _filters: &[Expr],
+            _agg_with_grouping: Option<&AggWithGrouping>,
+            _limit: Option<usize>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            todo!()
+        }
+    }
+
+    fn session() -> SessionCtx {
+        let user_desc = UserDesc::new(
+            0_u128,
+            "test_name".to_string(),
+            UserOptions::default(),
+            false,
+        );
+        let user = User::new(user_desc, HashSet::default());
+        let context = ContextBuilder::new(user).build();
+        let pool = UnboundedMemoryPool::default();
+        SessionCtxFactory::default()
+            .create_session_ctx("", context, 0_u128, Arc::new(pool))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_drop() {
         let sql = "drop table if exists test_tb";
         let mut statements = ExtParser::parse_sql(sql).unwrap();
         assert_eq!(statements.len(), 1);
         let test = MockContext {};
-        let planner = SqlPlaner::new(test);
+        let planner = SqlPlaner::new(&test);
         let plan = planner
-            .statement_to_plan(statements.pop_back().unwrap())
+            .statement_to_plan(statements.pop_back().unwrap(), &session())
+            .await
             .unwrap();
-        if let Plan::DDL(DDLPlan::Drop(drop)) = plan {
+        if let Plan::DDL(DDLPlan::DropDatabaseObject(drop)) = plan.plan {
             println!("{:?}", drop);
         } else {
             panic!("expected drop plan")
         }
     }
 
-    #[test]
-    fn test_create_table() {
-        let sql = "CREATE TABLE IF NOT EXISTS test\
+    #[tokio::test]
+    async fn test_create_table() {
+        let sql = "CREATE TABLE IF NOT EXISTS default_catalog.default_schema.test\
             (column1 BIGINT CODEC(DELTA),\
             column2 STRING CODEC(GZIP),\
             column3 BIGINT UNSIGNED CODEC(NULL),\
@@ -786,11 +2379,12 @@ mod tests {
         let mut statements = ExtParser::parse_sql(sql).unwrap();
         assert_eq!(statements.len(), 1);
         let test = MockContext {};
-        let planner = SqlPlaner::new(test);
+        let planner = SqlPlaner::new(&test);
         let plan = planner
-            .statement_to_plan(statements.pop_back().unwrap())
+            .statement_to_plan(statements.pop_back().unwrap(), &session())
+            .await
             .unwrap();
-        if let Plan::DDL(DDLPlan::CreateTable(create)) = plan {
+        if let Plan::DDL(DDLPlan::CreateTable(create)) = plan.plan {
             assert_eq!(
                 create,
                 CreateTable {
@@ -798,8 +2392,8 @@ mod tests {
                         TableColumn {
                             id: 0,
                             name: "time".to_string(),
-                            column_type: ColumnType::Time,
-                            encoding: Encoding::Default
+                            column_type: ColumnType::Time(Nanosecond),
+                            encoding: Encoding::Default,
                         },
                         TableColumn {
                             id: 1,
@@ -842,10 +2436,11 @@ mod tests {
                             name: "column5".to_string(),
                             column_type: ColumnType::Field(ValueType::Float),
                             encoding: Encoding::Gorilla,
-                        }
+                        },
                     ],
-                    name: "test".to_string(),
-                    if_not_exists: true
+                    name: TableReference::parse_str("test")
+                        .resolve_object("default_catalog", "default_schema"),
+                    if_not_exists: true,
                 }
             );
         } else {
@@ -853,17 +2448,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_create_database() {
+    #[tokio::test]
+    async fn test_create_database() {
         let sql = "CREATE DATABASE test WITH TTL '10' SHARD 5 VNODE_DURATION '3d' REPLICA 10 PRECISION 'us';";
         let mut statements = ExtParser::parse_sql(sql).unwrap();
         assert_eq!(statements.len(), 1);
         let test = MockContext {};
-        let planner = SqlPlaner::new(test);
+        let planner = SqlPlaner::new(&test);
         let plan = planner
-            .statement_to_plan(statements.pop_back().unwrap())
+            .statement_to_plan(statements.pop_back().unwrap(), &session())
+            .await
             .unwrap();
-        if let Plan::DDL(DDLPlan::CreateDatabase(create)) = plan {
+        if let Plan::DDL(DDLPlan::CreateDatabase(create)) = plan.plan {
             let ans = format!("{:?}", create);
             println!("{ans}");
             let expected = r#"CreateDatabase { name: "test", if_not_exists: false, options: DatabaseOptions { ttl: Some(Duration { time_num: 10, unit: Day }), shard_num: Some(5), vnode_duration: Some(Duration { time_num: 3, unit: Day }), replica: Some(10), precision: Some(US) } }"#;
@@ -873,47 +2469,53 @@ mod tests {
         }
     }
 
-    #[test]
-    #[should_panic(expected = "Field or Tag name should not have same")]
-    fn test_create_table_filed_name_same() {
-        let sql = "CREATE TABLE air (visibility DOUBLE,temperature DOUBLE,presssure DOUBLE,presssure DOUBLE,TAGS(station));";
+    #[tokio::test]
+    async fn test_create_table_filed_name_same() {
+        let sql = "CREATE TABLE air (visibility DOUBLE,temperature DOUBLE,pressure DOUBLE,pressure DOUBLE,TAGS(station));";
         let mut statements = ExtParser::parse_sql(sql).unwrap();
         assert_eq!(statements.len(), 1);
         let test = MockContext {};
-        let planner = SqlPlaner::new(test);
-        planner
-            .statement_to_plan(statements.pop_back().unwrap())
+        let planner = SqlPlaner::new(&test);
+        let error = planner
+            .statement_to_plan(statements.pop_back().unwrap(), &session())
+            .await
+            .err()
             .unwrap();
+        assert!(matches!(error, QueryError::SameColumnName {column} if column.eq("pressure")));
     }
 
-    #[test]
-    #[should_panic(expected = "Field or Tag name should not have same")]
-    fn test_create_table_tag_name_same() {
+    #[tokio::test]
+    async fn test_create_table_tag_name_same() {
         let sql = "CREATE TABLE air (visibility DOUBLE,temperature DOUBLE,presssure DOUBLE,TAGS(station,station));";
         let mut statements = ExtParser::parse_sql(sql).unwrap();
         assert_eq!(statements.len(), 1);
         let test = MockContext {};
-        let planner = SqlPlaner::new(test);
-        planner
-            .statement_to_plan(statements.pop_back().unwrap())
+        let planner = SqlPlaner::new(&test);
+        let error = planner
+            .statement_to_plan(statements.pop_back().unwrap(), &session())
+            .await
+            .err()
             .unwrap();
+        assert!(matches!(error, QueryError::SameColumnName {column} if column.eq("station")));
     }
 
-    #[test]
-    #[should_panic(expected = "Field or Tag name should not have same")]
-    fn test_create_table_tag_field_same_name() {
-        let sql = "CREATE TABLE air (visibility DOUBLE,temperature DOUBLE,presssure DOUBLE,TAGS(station,presssure));";
+    #[tokio::test]
+    async fn test_create_table_tag_field_same_name() {
+        let sql = "CREATE TABLE air (visibility DOUBLE,temperature DOUBLE,pressure DOUBLE,TAGS(station,pressure));";
         let mut statements = ExtParser::parse_sql(sql).unwrap();
         assert_eq!(statements.len(), 1);
         let test = MockContext {};
-        let planner = SqlPlaner::new(test);
-        planner
-            .statement_to_plan(statements.pop_back().unwrap())
+        let planner = SqlPlaner::new(&test);
+        let error = planner
+            .statement_to_plan(statements.pop_back().unwrap(), &session())
+            .await
+            .err()
             .unwrap();
+        assert!(matches!(error, QueryError::SameColumnName {column} if column.eq("pressure")));
     }
 
-    #[test]
-    fn test_insert_select() {
+    #[tokio::test]
+    async fn test_insert_select() {
         let sql = "insert test_tb(field_int, field_string)
                          select column1, column2
                          from
@@ -922,15 +2524,16 @@ mod tests {
         let mut statements = ExtParser::parse_sql(sql).unwrap();
         assert_eq!(statements.len(), 1);
         let test = MockContext {};
-        let planner = SqlPlaner::new(test);
+        let planner = SqlPlaner::new(&test);
         let plan = planner
-            .statement_to_plan(statements.pop_back().unwrap())
+            .statement_to_plan(statements.pop_back().unwrap(), &session())
+            .await
             .unwrap();
 
-        match plan {
+        match plan.plan {
             Plan::Query(QueryPlan {
-                df_plan: LogicalPlan::Aggregate(Aggregate { input, .. }),
-            }) => match input.as_ref() {
+                df_plan: LogicalPlan::Extension(Extension { node }),
+            }) => match &node.inputs()[0] {
                 LogicalPlan::Extension(Extension { node }) => {
                     match node.as_any().downcast_ref::<TableWriterPlanNode>() {
                         Some(TableWriterPlanNode {

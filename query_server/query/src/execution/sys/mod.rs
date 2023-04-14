@@ -4,18 +4,14 @@ mod show_queries;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use snafu::ResultExt;
-use spi::query::{self, Result};
-use spi::query::{
-    dispatcher::{QueryInfo, QueryStatus},
-    execution::{ExecutionError, Output, QueryExecution, QueryStateMachineRef},
-    logical_planner::SYSPlan,
-};
-
-use crate::dispatcher::query_tracker::QueryTracker;
+use spi::query::dispatcher::{QueryInfo, QueryStatus};
+use spi::query::execution::{Output, QueryExecution, QueryStateMachineRef};
+use spi::query::logical_planner::SYSPlan;
+use spi::Result;
 
 use self::kill_query::KillQueryTask;
 use self::show_queries::ShowQueriesTask;
+use crate::dispatcher::query_tracker::QueryTracker;
 
 pub struct SystemExecution {
     task_factory: SystemTaskFactory,
@@ -50,8 +46,7 @@ impl QueryExecution for SystemExecution {
             .task_factory
             .create_task()
             .execute(query_state_machine.clone())
-            .await
-            .context(query::ExecutionSnafu);
+            .await;
 
         query_state_machine.end_schedule();
 
@@ -67,7 +62,9 @@ impl QueryExecution for SystemExecution {
         QueryInfo::new(
             qsm.query_id,
             qsm.query.content().to_string(),
-            qsm.query.context().user_info().user.to_string(),
+            *qsm.session.tenant_id(),
+            qsm.session.tenant().to_string(),
+            qsm.query.context().user_info().desc().clone(),
         )
     }
     // 运行时信息
@@ -82,10 +79,7 @@ impl QueryExecution for SystemExecution {
 /// Traits that system tasks should implement
 #[async_trait]
 trait SystemTask: Send + Sync {
-    async fn execute(
-        &self,
-        query_state_machine: QueryStateMachineRef,
-    ) -> std::result::Result<Output, ExecutionError>;
+    async fn execute(&self, query_state_machine: QueryStateMachineRef) -> Result<Output>;
 }
 
 struct SystemTaskFactory {

@@ -1,15 +1,19 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::{logical_expr::LogicalPlan, physical_plan::ExecutionPlan};
+use datafusion::logical_expr::LogicalPlan;
+use datafusion::physical_plan::ExecutionPlan;
 
-use super::{session::IsiphoSessionCtx, Result};
+use super::session::SessionCtx;
+use crate::Result;
+
+pub type OptimizerRef = Arc<dyn Optimizer + Send + Sync>;
 
 #[async_trait]
 pub trait Optimizer {
     async fn optimize(
         &self,
         plan: &LogicalPlan,
-        session: &IsiphoSessionCtx,
+        session: &SessionCtx,
     ) -> Result<Arc<dyn ExecutionPlan>>;
 }

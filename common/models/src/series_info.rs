@@ -1,18 +1,17 @@
-use crate::Error::InvalidFlatbufferMessage;
-use crate::{
-    errors::{Error, Result},
-    tag, SeriesId, Tag,
-};
 use protos::models as fb_models;
 use serde::{Deserialize, Serialize};
+use utils::bitset::BitSet;
 use utils::BkdrHasher;
+
+use crate::errors::{Error, Result};
+use crate::{tag, SeriesId, Tag, TagValue};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SeriesKey {
-    id: SeriesId,
-    tags: Vec<Tag>,
-    table: String,
-    db: String,
+    pub id: SeriesId,
+    pub tags: Vec<Tag>,
+    pub table: String,
+    pub db: String,
 }
 
 impl SeriesKey {
@@ -35,14 +34,20 @@ impl SeriesKey {
         bincode::serialize(self).unwrap()
     }
 
-    pub fn tag_val(&self, key: &str) -> Vec<u8> {
+    pub fn tag_val(&self, key: &str) -> Option<TagValue> {
         for tag in &self.tags {
             if tag.key == key.as_bytes() {
-                return tag.value.clone();
+                return Some(tag.value.clone());
             }
         }
+        None
+    }
 
-        vec![]
+    pub fn tag_string_val(&self, key: &str) -> Result<Option<String>> {
+        match self.tag_val(key) {
+            Some(v) => Ok(Some(String::from_utf8(v)?)),
+            None => Ok(None),
+        }
     }
 
     pub fn hash(&self) -> u64 {
@@ -75,56 +80,48 @@ impl SeriesKey {
 
         str
     }
-    pub fn from_flatbuffer(point: &fb_models::Point) -> Result<Self> {
-        let mut tags = match point.tags() {
-            Some(tags_inner) => {
-                let mut tags = Vec::with_capacity(tags_inner.len());
-                for t in tags_inner.into_iter() {
-                    tags.push(Tag::from_flatbuffers(&t)?);
-                }
-                tags
-            }
 
-            None => {
-                return Err(InvalidFlatbufferMessage {
-                    err: "Point tags cannot be empty".to_string(),
-                })
+    pub fn build_series_key(
+        db_name: &str,
+        tab_name: &str,
+        tag_names: &[&str],
+        point: &fb_models::Point,
+    ) -> Result<Self> {
+        let tag_nullbit_buffer = point.tags_nullbit().ok_or(Error::InvalidTag {
+            err: "point tag null bit".to_string(),
+        })?;
+        let len = tag_names.len();
+        let tag_nullbit = BitSet::new_without_check(len, tag_nullbit_buffer.bytes());
+        let mut tags = Vec::new();
+        for (idx, (tag_key, tag_value)) in tag_names
+            .iter()
+            .zip(point.tags().ok_or(Error::InvalidTag {
+                err: "point tag value".to_string(),
+            })?)
+            .enumerate()
+        {
+            if !tag_nullbit.get(idx) {
+                continue;
             }
-        };
-
-        let db = match point.db() {
-            Some(db) => String::from_utf8(db.to_vec()).map_err(|err| InvalidFlatbufferMessage {
-                err: err.to_string(),
-            })?,
-
-            None => {
-                return Err(Error::InvalidFlatbufferMessage {
-                    err: "Point db name cannot be empty".to_string(),
-                })
-            }
-        };
-
-        let table = match point.tab() {
-            Some(table) => {
-                String::from_utf8(table.to_vec()).map_err(|err| InvalidFlatbufferMessage {
-                    err: err.to_string(),
-                })?
-            }
-
-            None => {
-                return Err(InvalidFlatbufferMessage {
-                    err: "Point table name cannot be empty".to_string(),
-                })
-            }
-        };
+            tags.push(Tag::new(
+                tag_key.as_bytes().to_vec(),
+                tag_value
+                    .value()
+                    .ok_or(Error::InvalidTag {
+                        err: "tag missing value".to_string(),
+                    })?
+                    .bytes()
+                    .into(),
+            ))
+        }
 
         tag::sort_tags(&mut tags);
 
         Ok(Self {
             id: 0,
             tags,
-            db,
-            table,
+            table: tab_name.to_string(),
+            db: db_name.to_string(),
         })
     }
 }

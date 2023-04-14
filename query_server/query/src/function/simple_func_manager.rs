@@ -1,7 +1,11 @@
-use std::{collections::HashMap, sync::Arc};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use datafusion::logical_expr::{AggregateUDF, ScalarUDF};
 use spi::query::function::*;
+use spi::{QueryError, Result};
+
+pub type SimpleFunctionMetadataManagerRef = Arc<SimpleFunctionMetadataManager>;
 
 #[derive(Debug, Default)]
 pub struct SimpleFunctionMetadataManager {
@@ -27,7 +31,7 @@ impl FunctionMetadataManager for SimpleFunctionMetadataManager {
     fn udf(&self, name: &str) -> Result<Arc<ScalarUDF>> {
         let result = self.scalar_functions.get(&name.to_uppercase());
 
-        result.cloned().ok_or_else(|| Error::NotExists {
+        result.cloned().ok_or_else(|| QueryError::FunctionExists {
             name: name.to_string(),
         })
     }
@@ -35,12 +39,14 @@ impl FunctionMetadataManager for SimpleFunctionMetadataManager {
     fn udaf(&self, name: &str) -> Result<Arc<AggregateUDF>> {
         let result = self.aggregate_functions.get(&name.to_uppercase());
 
-        result.cloned().ok_or_else(|| Error::NotExists {
-            name: name.to_string(),
-        })
+        result
+            .cloned()
+            .ok_or_else(|| QueryError::FunctionNotExists {
+                name: name.to_string(),
+            })
     }
 
-    fn udfs(&self) -> Vec<Arc<ScalarUDF>> {
-        self.scalar_functions.values().cloned().collect()
+    fn udfs(&self) -> HashSet<String> {
+        self.scalar_functions.keys().cloned().collect()
     }
 }
