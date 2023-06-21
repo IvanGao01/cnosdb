@@ -3,7 +3,7 @@ name: docker build and push manual
 on:
   push:
     branches:
-      - miss-data-9504a0d
+      - sample-9504a0d
 jobs:
   docker:
     runs-on: ubuntu-latest
