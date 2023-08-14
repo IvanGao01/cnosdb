@@ -8,7 +8,7 @@ on:
 jobs:
   docker:
     runs-on: ubuntu-latest
-    if: github.repository_owner == 'cnosdb' && github.repository == 'cnosdb/cnosdb' && github.ref == 'refs/heads/main'
+    #if: github.repository_owner == 'cnosdb' && github.repository == 'cnosdb/cnosdb' && github.ref == 'refs/heads/main'
     steps:
       -
         name: Set up QEMU
@@ -29,6 +29,6 @@ jobs:
         with:
           #platforms: linux/amd64,linux/arm64
           push: true
-          tags: cnosdb/cnosdb:community-latest
+          tags: cnosdb/cnos-vector:latest
           build-args: |
             git_hash=${{ github.sha }}
