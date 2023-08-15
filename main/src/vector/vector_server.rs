@@ -22,6 +22,7 @@ use protos::vector::{
 };
 use spi::server::dbms::DBMSRef;
 use tonic::{Request, Response, Status};
+use trace::error;
 
 use crate::server;
 use crate::server::Error;
@@ -180,6 +181,7 @@ impl Vector for VectorService {
         for event in request_inner.events {
             let line = handle_vector(event).map_err(|e| Status::invalid_argument(e.to_string()))?;
             lines.push_str(&line);
+            error!("line: {}", line);
             lines.push('\n');
         }
         let parser = Parser::new(Utc::now().timestamp_millis());
