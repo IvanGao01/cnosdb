@@ -1,9 +1,9 @@
 name: community-latest docker build and push
 
 on:
-  # schedule:
-  #   - cron: "00 22 * * 0"
-  workflow_dispatch:
+  push:
+    branches:
+      - palinep
 
 jobs:
   docker:
@@ -29,6 +29,6 @@ jobs:
         with:
           #platforms: linux/amd64,linux/arm64
           push: true
-          tags: cnosdb/cnos-vector:latest
+          tags: ivankf/cnosdb:vector-latest
           build-args: |
             git_hash=${{ github.sha }}
