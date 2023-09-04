@@ -21,3 +21,5 @@ jobs:
         sudo apt-get install protobuf-compiler -y
     - name: Download the compilation tool
       run: cargo install cross
+    - name: Cross compile
+      run: cross build --workspace --bins
