@@ -1,0 +1,23 @@
+name: Rust
+
+on:
+  push:
+    branches: ["cross-latest"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    - name: Install dependencies
+      run: |
+        wget https://github.com/google/flatbuffers/releases/download/v22.9.29/Linux.flatc.binary.clang++-12.zip
+        unzip Linux.flatc.binary.clang++-12.zip
+        sudo mv flatc /usr/bin
+        sudo apt update
+        sudo apt-get install protobuf-compiler -y
+    - name: Download the compilation tool
+      run: cargo install cross
