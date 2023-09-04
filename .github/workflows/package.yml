@@ -19,7 +19,11 @@ jobs:
         sudo mv flatc /usr/bin
         sudo apt update
         sudo apt-get install protobuf-compiler -y
-    - name: Download the compilation tool
-      run: cargo install cross
-    - name: Cross compile
-      run: cross build --workspace --bins
+    - name: echo protoc version
+      run: protoc --version
+    - name: echo flatc version
+      run: flatc --version
+    # - name: Download the compilation tool
+    #   run: cargo install cross
+    # - name: Cross compile
+    #   run: cross build --workspace --bins
