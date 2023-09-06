@@ -26,5 +26,5 @@ jobs:
     - name: Install cross-rs
       run: cargo install cross
     - name: Cross compile
-      run: ｜
+      run: |
         cross build --workspace --bins
