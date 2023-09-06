@@ -23,7 +23,8 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y protobuf-compiler
+    - name: Install cross-rs
+      run: cargo install cross
     - name: Cargo compile
       run: ｜
-        cargo install cross
         cargo build --workspace --bins
