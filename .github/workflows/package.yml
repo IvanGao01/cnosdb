@@ -23,7 +23,9 @@ jobs:
       run: protoc --version
     - name: echo flatc version
       run: flatc --version
-    # - name: Download the compilation tool
-    #   run: cargo install cross
-    # - name: Cross compile
-    #   run: cross build --workspace --bins
+    - name: Download the compilation tool
+      run: cargo install cross
+    - name: Cross compile
+      run: |
+        export PROTOC=/usr/bin/protoc
+        cross build --workspace --bins
