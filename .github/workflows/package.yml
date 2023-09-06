@@ -27,5 +27,5 @@ jobs:
       run: cargo install cross
     - name: Cross compile
       run: |
-        export PROTOC=/usr/bin/protoc
+        /usr/bin/protoc
         cross build --workspace --bins
