@@ -16,13 +16,9 @@ jobs:
       run: |
         wget https://github.com/google/flatbuffers/releases/download/v22.9.29/Linux.flatc.binary.clang++-12.zip
         unzip Linux.flatc.binary.clang++-12.zip
-        sudo mv flatc /usr/bin
-        sudo apt update
-        sudo apt-get install protobuf-compiler -y
-    - name: echo protoc version
-      run: protoc --version
-    - name: echo flatc version
-      run: flatc --version
+        mv flatc /usr/bin
+        apt-get update
+        apt-get install -y protobuf-compiler
     - name: Download the compilation tool
       run: cargo install cross
     - name: Cross compile
