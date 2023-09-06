@@ -12,16 +12,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v3
-    - name: Install dependencies
+    - name: Install Build Dependencies
+      shell: bash
       run: |
-        wget https://github.com/google/flatbuffers/releases/download/v22.9.29/Linux.flatc.binary.clang++-12.zip
-        unzip Linux.flatc.binary.clang++-12.zip
-        sudo mv flatc /usr/bin
+        curl -o flatbuffers.zip -sL https://github.com/google/flatbuffers/releases/download/v22.9.29/Linux.flatc.binary.clang++-12.zip
+        unzip  flatbuffers.zip
+        mv flatc /usr/local/bin
+    - name: Install Protoc
+      shell: bash
+      run: |
         sudo apt-get update
         sudo apt-get install -y protobuf-compiler
-    - name: Download the compilation tool
-      run: cargo install cross
-    - name: Cross compile
-      run: |
-        sudo chmod +x /usr/bin/protoc
-        cross build --workspace --bins
+        protoc --version
+    - name: Cargo compile
+      run: cargo build --workspace --bins
