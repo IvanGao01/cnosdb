@@ -34,5 +34,5 @@ jobs:
         target: ${{ matrix.target }}
     - name: Cargo compile
       run: |
-        rustup default
+        cargo build --workspace --bins --target ${{ matrix.target }}
         
