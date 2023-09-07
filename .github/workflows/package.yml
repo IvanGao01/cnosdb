@@ -1,13 +1,9 @@
 name: Rust
-
-permissions:
-  contents: write
-
 on:
   push:
-    tags:
-      - v[0-9]+.*
-    # branches: ["cross-latest"]
+    # tags:
+      # - v[0-9]+.*
+    branches: ["cross-latest"]
 
 env:
   CARGO_TERM_COLOR: always
