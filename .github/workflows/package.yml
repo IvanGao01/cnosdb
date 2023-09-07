@@ -33,11 +33,11 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y protobuf-compiler
-    - name: Cross compile 
-      uses: taiki-e/setup-cross-toolchain-action@v1
-      with:
-        target: ${{ matrix.target }}
-    - run: cargo build --workspace --bins
+    # - name: Cross compile 
+    #   uses: taiki-e/setup-cross-toolchain-action@v1
+    #   with:
+    #     target: ${{ matrix.target }}
+    # - run: cargo build --workspace --bins
   create-release:
     runs-on: ubuntu-latest
     steps:
