@@ -9,6 +9,10 @@ env:
 
 jobs:
   build:
+    strategy:
+      matrix:
+        target:
+          - aarch64-unknown-linux-gnu
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v3
@@ -23,8 +27,10 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y protobuf-compiler
-    - name: Install cross-rs
-      run: cargo install cross
-    - name: Cross compile
+    - name: Install cross-compilation tools
+      uses: taiki-e/setup-cross-toolchain-action@v1
+      with:
+        target: ${{ matrix.target }}
+    - name: Cargo compile
       run: |
-        cross build --workspace --bins
+        cargo build --workspace --bins
