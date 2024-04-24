@@ -57,4 +57,13 @@ elif [[ -f /etc/debian_version ]]; then
         install_init
         install_update_rcd
     fi
+elif [[ -f /etc/kylin-release ]]; then
+    # kylin logic
+    if command -v systemctl &>/dev/null; then
+        install_systemd
+    else
+        # Assuming sysv
+        install_init
+        install_chkconfig
+    fi
 fi
